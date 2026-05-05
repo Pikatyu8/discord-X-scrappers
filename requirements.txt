@@ -1,0 +1,4 @@
+scrapling[all]
+requests
+yt-dlp
+playwright
