@@ -10,13 +10,13 @@ from scrapling.parser import Selector
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- Настройка сессии для стабильной загрузки картинок ---
+# --- Session setup for stable image downloads ---
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def get_chrome_testing_user_data_dir():
-    """Определяет путь к профилю Chrome for Testing."""
+    """Determines the path to the Chrome for Testing profile directory."""
     if sys.platform == "win32":
         return os.path.join(os.environ["LOCALAPPDATA"], "Google", "Chrome for Testing", "User Data")
     elif sys.platform == "darwin":
@@ -25,8 +25,8 @@ def get_chrome_testing_user_data_dir():
         return os.path.expanduser("~/.config/google-chrome-for-testing")
 
 def download_image(url, save_path):
-    """Скачивает картинку в максимальном качестве (orig)."""
-    # Заменяем любой размер (small, medium, 240x240) на оригинальный
+    """Downloads an image in maximum quality (orig)."""
+    # Replace any size parameter (small, medium, 240x240) with original
     url = re.sub(r'name=[^&]+', 'name=orig', url)
     try:
         response = session.get(url, stream=True, timeout=30)
@@ -36,7 +36,7 @@ def download_image(url, save_path):
                 f.write(chunk)
         return True
     except Exception as e:
-        print(f"Ошибка загрузки картинки {url}: {e}")
+        print(f"Error downloading image {url}: {e}")
         return False
 
 def scrape_bookmarks_media():
@@ -48,7 +48,7 @@ def scrape_bookmarks_media():
         executable_path = p.chromium.executable_path
         user_data_dir = get_chrome_testing_user_data_dir()
         
-        print(f"Запускаю Chrome с профилем: {user_data_dir}")
+        print(f"Launching Chrome with profile: {user_data_dir}")
         browser = p.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
             executable_path=executable_path,
@@ -59,8 +59,8 @@ def scrape_bookmarks_media():
         
         page = browser.pages[0] if browser.pages else browser.new_page()
         
-        # --- ЭКСПОРТ КУКИ ДЛЯ YT-DLP ---
-        print("Подготавливаю куки...")
+        # --- EXPORT COOKIES FOR YT-DLP ---
+        print("Preparing cookies...")
         page.goto("https://x.com", wait_until="domcontentloaded")
         cookies = browser.cookies()
         with open(COOKIE_FILE, "w", encoding="utf-8") as f:
@@ -76,7 +76,7 @@ def scrape_bookmarks_media():
                 f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
         
         target_url = "https://x.com/i/bookmarks"
-        print(f"Перехожу в закладки: {target_url}")
+        print(f"Navigating to bookmarks: {target_url}")
         page.goto(target_url, wait_until="domcontentloaded")
         time.sleep(5) 
         
@@ -102,10 +102,10 @@ def scrape_bookmarks_media():
                 if post_url in scraped_posts:
                     continue
 
-                # --- ОБНАРУЖЕНИЕ МЕДИА ---
+                # --- MEDIA DETECTION ---
                 img_urls = tweet.css('[data-testid="tweetPhoto"] img::attr(src)').getall()
-                # Ищем видео по кнопке Play или по тексту в aria-label (как в вашем HTML)
-                has_video = bool(tweet.css('[data-testid="playButton"], [data-testid="videoPlayer"], [aria-label*="видео"], [aria-label*="Video"]').get())
+                # Detect video via Play button, video player, or aria-labels (supports English/Russian)
+                has_video = bool(tweet.css('[data-testid="playButton"], [data-testid="videoPlayer"], [aria-label*="video"], [aria-label*="видео"]').get())
                 
                 if not img_urls and not has_video:
                     continue
@@ -116,10 +116,10 @@ def scrape_bookmarks_media():
 
                 local_media_paths = []
 
-                # --- СКАЧИВАНИЕ ВИДЕО ---
+                # --- VIDEO DOWNLOAD ---
                 if has_video:
                     video_filename_template = f"{MEDIA_DIR}/{tweet_id}_video.%(ext)s"
-                    print(f"Скачиваю видео через yt-dlp: {post_url}")
+                    print(f"Downloading video via yt-dlp: {post_url}")
                     
                     cmd = [
                         "yt-dlp",
@@ -129,20 +129,20 @@ def scrape_bookmarks_media():
                     ]
                     
                     try:
-                        # Запускаем без подавления вывода, чтобы видеть ошибки если они будут
+                        # Run without suppressing output to see potential errors
                         subprocess.run(cmd, check=True)
                         
-                        # Проверяем, какой файл в итоге создался (mp4/mkv/etc)
+                        # Verify which file was actually created (mp4/mkv/etc)
                         for file in os.listdir(MEDIA_DIR):
                             if file.startswith(f"{tweet_id}_video"):
                                 local_media_paths.append(os.path.abspath(os.path.join(MEDIA_DIR, file)))
                     except Exception as e:
-                        print(f"Ошибка yt-dlp для {post_url}: {e}")
+                        print(f"yt-dlp error for {post_url}: {e}")
 
-                # --- СКАЧИВАНИЕ КАРТИНОК ---
+                # --- IMAGE DOWNLOAD ---
                 for idx, img_url in enumerate(img_urls):
-                    # Если это обложка видео, yt-dlp скачает само видео, 
-                    # но мы также скачаем картинку на случай если это пост с фото.
+                    # If this is a video thumbnail, yt-dlp handles the video,
+                    # but we also download the image in case it's a photo post.
                     ext = "png" if "format=png" in img_url else "jpg"
                     filename = f"{tweet_id}_img_{idx}.{ext}"
                     filepath = os.path.join(MEDIA_DIR, filename)
@@ -156,9 +156,9 @@ def scrape_bookmarks_media():
                     "text": full_text,
                     "local_media": local_media_paths
                 }
-                print(f"Сохранен пост {post_url} (Медиа файлов: {len(local_media_paths)})")
+                print(f"Saved post {post_url} (Media files: {len(local_media_paths)})")
 
-            # Логика прокрутки
+            # Scrolling logic
             if len(scraped_posts) == previous_count:
                 no_new_posts_count += 1
             else:
@@ -166,10 +166,10 @@ def scrape_bookmarks_media():
                 
             previous_count = len(scraped_posts)
             if no_new_posts_count >= 3:
-                print("Новых закладок больше нет.")
+                print("No new bookmarks found.")
                 break
             
-            print(f"Собрано {len(scraped_posts)}. Листаю вниз...")
+            print(f"Collected {len(scraped_posts)}. Scrolling down...")
             page.keyboard.press("PageDown")
             time.sleep(3)
 
@@ -180,7 +180,7 @@ def scrape_bookmarks_media():
         with open("bookmarks.json", "w", encoding="utf-8") as f:
             json.dump(list(scraped_posts.values()), f, ensure_ascii=False, indent=4)
         
-        print(f"\nГотово! Постов: {len(scraped_posts)}. Данные в bookmarks.json")
+        print(f"\nDone! Total posts: {len(scraped_posts)}. Data saved to bookmarks.json")
 
 if __name__ == "__main__":
     scrape_bookmarks_media()
