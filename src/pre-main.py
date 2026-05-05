@@ -3,9 +3,9 @@ import sys
 from playwright.sync_api import sync_playwright
 
 def get_chrome_testing_user_data_dir():
-    """Определяет путь к профилю Chrome for Testing в зависимости от ОС."""
+    """Determines the Chrome for Testing profile path depending on the OS."""
     if sys.platform == "win32":
-        # Именно эта папка используется Chrome for Testing на Windows
+        # This specific folder is used by Chrome for Testing on Windows
         return os.path.join(os.environ["LOCALAPPDATA"], "Google", "Chrome for Testing", "User Data")
     elif sys.platform == "darwin":  # macOS
         return os.path.expanduser("~/Library/Application Support/Google/Chrome for Testing")
@@ -14,20 +14,20 @@ def get_chrome_testing_user_data_dir():
 
 def check_my_profile():
     with sync_playwright() as p:
-        # 1. Автоматически находим путь к установленному в системе Chrome for Testing
+        # 1. Automatically find the path to the installed Chrome for Testing system-wide
         executable_path = p.chromium.executable_path
         
-        # 2. Получаем путь к папке профиля именно этого браузера
+        # 2. Get the profile folder path specifically for this browser
         user_data_dir = get_chrome_testing_user_data_dir()
 
-        print(f"Запуск Chrome for Testing...")
-        print(f"Путь к EXE: {executable_path}")
-        print(f"Путь к профилю: {user_data_dir}")
+        print(f"Launching Chrome for Testing...")
+        print(f"EXE Path: {executable_path}")
+        print(f"Profile Path: {user_data_dir}")
 
-        # Проверка на наличие браузера
+        # Check if the browser exists
         if not os.path.exists(executable_path):
-            print("\nОШИБКА: Chrome for Testing не найден.")
-            print("Выполни в терминале: playwright install chromium")
+            print("\nERROR: Chrome for Testing not found.")
+            print("Run in terminal: playwright install chromium")
             return
 
         browser = p.chromium.launch_persistent_context(
@@ -40,12 +40,12 @@ def check_my_profile():
         
         page = browser.pages[0] if browser.pages else browser.new_page()
         
-        print("Перехожу на X.com...")
+        print("Navigating to X.com...")
         page.goto("https://x.com/home")
         
-        # Проверка: залогинены ли мы?
-        print("\nПроверь окно браузера. Если сессия подтянулась — ты увидишь свою ленту.")
-        input("Нажми ENTER, чтобы закрыть браузер...")
+        # Verification: are we logged in?
+        print("\nCheck the browser window.")
+        input("Press ENTER to close the browser...")
         browser.close()
 
 if __name__ == "__main__":
