@@ -29,13 +29,23 @@ def generate_html_content(data):
         
         # --- POST HEADER ---
         html_parts.append("<div class='header'>")
-        # For Discord
+        # For Discord or items with explicit author
         if "author" in item:
             html_parts.append(f"<span class='author'>{html.escape(item['author'])}</span>")
+        # Extract author for Bluesky posts from the URL
+        elif "url" in item and "bsky.app/profile/" in item["url"]:
+            parts = item["url"].split("/")
+            try:
+                # Извлекаем никнейм сразу после /profile/
+                author = parts[parts.index("profile") + 1]
+                html_parts.append(f"<span class='author'>@{html.escape(author)}</span>")
+            except (ValueError, IndexError):
+                pass
+                
         # Date
         if "date" in item and item["date"]:
             html_parts.append(f"<span class='date'>{html.escape(item['date'])}</span>")
-        # Link (for Twitter)
+        # Link (for Twitter/Bluesky)
         if "url" in item:
             html_parts.append(f" | <a href='{item['url']}'>Original Link</a>")
         html_parts.append("</div>")
@@ -128,12 +138,15 @@ if __name__ == "__main__":
     print("=== Collected Data to PDF Converter ===")
     print("1. Twitter (bookmarks.json -> twitter_bookmarks.pdf)")
     print("2. Discord (disc_msgs.json -> discord_messages.pdf)")
+    print("3. Bluesky (bsky_bookmarks.json -> bsky_bookmarks.pdf)")
     
-    choice = input("\nChoose a file for conversion (1 or 2): ").strip()
+    choice = input("\nChoose a file for conversion (1, 2 or 3): ").strip()
     
     if choice == "1":
         convert_json_to_pdf("bookmarks.json", "twitter_bookmarks.pdf")
     elif choice == "2":
         convert_json_to_pdf("disc_msgs.json", "discord_messages.pdf")
+    elif choice == "3":
+        convert_json_to_pdf("bsky_bookmarks.json", "bsky_bookmarks.pdf")
     else:
         print("Invalid choice.")
