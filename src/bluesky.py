@@ -192,7 +192,7 @@ def scrape_bookmarks_media():
 
                 print(f"Collected {len(scraped_posts)} posts. Idle scrolls: {no_new_posts_count}/100. Scrolling down...", end="\r")
                 page.keyboard.press("PageDown")
-                time.sleep(1)
+                time.sleep(0.2)
 
         except KeyboardInterrupt:
             print("\n\n[!] Stop signal received (CTRL+C). Terminating collection...")
