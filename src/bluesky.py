@@ -1,219 +1,172 @@
 import os
-import sys
-import time
 import json
-import requests
-import subprocess
-import re
+import html
+from pathlib import Path
 from playwright.sync_api import sync_playwright
-from scrapling.parser import Selector
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# --- Session setup for stable image downloads ---
-session = requests.Session()
-retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-session.mount('https://', HTTPAdapter(max_retries=retries))
+def generate_html_content(data):
+    """Generates HTML markup based on JSON data."""
+    
+    html_parts =[
+        "<!DOCTYPE html>",
+        "<html><head><meta charset='utf-8'>",
+        "<style>",
+        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f5f6f8; }",
+        ".card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); page-break-inside: avoid; }",
+        ".header { color: #65676b; font-size: 14px; margin-bottom: 12px; border-bottom: 1px solid #eee; padding-bottom: 8px; }",
+        ".author { font-weight: bold; color: #1da1f2; margin-right: 8px; }",
+        ".date { color: #888; }",
+        ".text { font-size: 15px; line-height: 1.5; white-space: pre-wrap; margin-bottom: 15px; word-wrap: break-word; color: #0f1419; }",
+        ".media-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }",
+        ".media-grid img { max-width: 100%; max-height: 500px; border-radius: 8px; border: 1px solid #eee; object-fit: contain; }",
+        ".video-label { display: inline-block; padding: 8px 12px; background: #e1e8ed; border-radius: 6px; font-size: 13px; color: #14171a; margin-top: 5px; }",
+        "a { color: #1da1f2; text-decoration: none; } a:hover { text-decoration: underline; }",
+        "</style></head><body>"
+    ]
 
-def get_chrome_testing_user_data_dir():
-    """Determines the path to the Chrome for Testing profile directory."""
-    if sys.platform == "win32":
-        return os.path.join(os.environ["LOCALAPPDATA"], "Google", "Chrome for Testing", "User Data")
-    elif sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/Google/Chrome for Testing")
-    else:
-        return os.path.expanduser("~/.config/google-chrome-for-testing")
-
-def download_image(url, save_path):
-    """Downloads an image in maximum quality (fullsize for Bluesky)."""
-    # Bluesky использует разные эндпоинты для миниатюр и полноразмерных фото.
-    # Заменяем feed_thumbnail на feed_fullsize для получения оригинала.
-    url = url.replace('/feed_thumbnail/', '/feed_fullsize/')
-    try:
-        response = session.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-        with open(save_path, 'wb') as f:
-            for chunk in response.iter_content(8192):
-                f.write(chunk)
-        return True
-    except Exception as e:
-        print(f"Error downloading image {url}: {e}")
-        return False
-
-def save_json_data(scraped_posts):
-    """Dynamically save data to JSON."""
-    with open("bsky_bookmarks.json", "w", encoding="utf-8") as f:
-        json.dump(list(scraped_posts.values()), f, ensure_ascii=False, indent=4)
-
-def scrape_bookmarks_media():
-    MEDIA_DIR = "./media"
-    COOKIE_FILE = "bsky_cookies.txt"
-    os.makedirs(MEDIA_DIR, exist_ok=True)
-
-    with sync_playwright() as p:
-        executable_path = p.chromium.executable_path
-        user_data_dir = get_chrome_testing_user_data_dir()
+    for item in data:
+        html_parts.append("<div class='card'>")
         
-        print(f"Launching Chrome with profile: {user_data_dir}")
-        browser = p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            executable_path=executable_path,
-            headless=False,
-            args=["--start-maximized"],
-            no_viewport=True,
-        )
-        
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        
-        # --- ШАГ 1: ОЖИДАНИЕ ПОЛЬЗОВАТЕЛЯ ---
-        page.goto("https://bsky.app/saved")
-        print("\n" + "="*50)
-        print("STEPS: Go to the desired page in your browser (saved/bookmarks, profile, etc.)")
-        print("Make sure you are logged in to Bluesky.")
-        print("="*50)
-        input("\nWhen you're ready to start collecting data, press ENTER on this terminal...")
-
-        # --- ШАГ 2: ПРОВЕРКА URL ---
-        current_url = page.url
-        print(f"Current URL: {current_url}")
-        
-        if current_url.rstrip('/') in["https://bsky.app", "https://bsky.app/home"]:
-            print("\n[!] WARNING: You are on the main page or in the feed (Home).")
-            print("[!] The script will only collect what is visible in the feed, not your saved posts.")
-            confirm = input("Continue anyway? (y/n): ")
-            if confirm.lower() != 'y':
-                browser.close()
-                return
-
-        # --- ШАГ 3: ЭКСПОРТ КУКИ ---
-        print("Refreshing cookies for yt-dlp...")
-        cookies = browser.cookies()
-        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            for c in cookies:
-                domain = c['domain']
-                flag = "TRUE" if domain.startswith('.') else "FALSE"
-                path = c['path']
-                secure = "TRUE" if c['secure'] else "FALSE"
-                expires = str(int(c.get('expires', 0)))
-                name = c['name']
-                value = c['value']
-                f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
-        
-        scraped_posts = {} 
-        no_new_posts_count = 0
-        previous_count = 0
-
-        print("\n=== Collection started. Press CTRL+C to stop ===")
-
-        try:
-            while True:
-                html_content = page.content()
-                selector = Selector(html_content)
-                # В Bluesky каждый пост в ленте обернут в элемент с data-testid начинающимся на feedItem-by-
-                posts = selector.css('[data-testid^="feedItem-by-"]')
-                
-                new_posts_in_batch = False
-
-                for post in posts:
-                    # Ищем ссылку на сам пост (содержит /post/)
-                    links = post.css('a::attr(href)').getall()
-                    post_path = next((link for link in links if '/post/' in link), None)
-                    
-                    if not post_path:
-                        continue
-                        
-                    post_url = f"https://bsky.app{post_path}"
-                    post_id = post_path.split('/')[-1]
-
-                    if post_url in scraped_posts:
-                        continue
-
-                    # Отбираем только изображения поста (игнорируем аватарки с /avatar/)
-                    img_urls = post.css('img[src*="/feed_thumbnail/"]::attr(src), img[src*="/feed_fullsize/"]::attr(src)').getall()
-                    
-                    # Проверяем наличие видео или GIF-анимаций (тег video или плеер)
-                    has_video = bool(post.css('video,[aria-label*="video"], [aria-label*="видео"], [aria-label*="Видео"], [data-testid="playButton"]').get())
-                    
-
-                    # Извлекаем текст
-                    text_parts = post.css('[data-testid="postText"] ::text').getall()
-                    full_text = "".join(text_parts).strip()
-                    
-                    # Извлекаем дату (В Bluesky она обычно лежит в aria-label или data-tooltip ссылки)
-                    date_elem = post.css('a[href*="/post/"][data-tooltip], a[href*="/post/"][aria-label]')
-                    date = date_elem.css('::attr(data-tooltip)').get()
-                    if not date:
-                        date = date_elem.css('::attr(aria-label)').get()
-
-                    local_media_paths =[]
-
-                    if has_video:
-                        video_filename_template = f"{MEDIA_DIR}/{post_id}_video.%(ext)s"
-                        print(f"\n[+] Downloading video: {post_url}")
-                        cmd =["yt-dlp", "--cookies", COOKIE_FILE, "-o", video_filename_template, post_url]
-                        try:
-                            subprocess.run(cmd, check=True, capture_output=True)
-                            for file in os.listdir(MEDIA_DIR):
-                                if file.startswith(f"{post_id}_video"):
-                                    local_media_paths.append(os.path.abspath(os.path.join(MEDIA_DIR, file)))
-                        except Exception as e:
-                            print(f"\n[!] yt-dlp error for {post_url}: {e}")
-
-                    for idx, img_url in enumerate(img_urls):
-                        ext = "jpg" # Bluesky использует jpeg/webp по умолчанию. .jpg подойдет отлично.
-                        filename = f"{post_id}_img_{idx}.{ext}"
-                        filepath = os.path.join(MEDIA_DIR, filename)
-                        if download_image(img_url, filepath):
-                            local_media_paths.append(os.path.abspath(filepath))
-
-                    scraped_posts[post_url] = {
-                        "url": post_url,
-                        "date": date or "Unknown",
-                        "text": full_text,
-                        "local_media": local_media_paths
-                    }
-                    new_posts_in_batch = True
-
-                # Логика выхода (100 скроллов безрезультатно)
-                if len(scraped_posts) == previous_count:
-                    no_new_posts_count += 1
-                    if no_new_posts_count >= 100:
-                        print("\n\n[!] 100 scrolls with no new posts. Limit reached (end of feed). Auto-stopping.")
-                        break
-                else:
-                    no_new_posts_count = 0
-                    
-                previous_count = len(scraped_posts)
-                
-                # Сохраняем промежуточный результат если нашлись новые посты
-                if new_posts_in_batch:
-                    save_json_data(scraped_posts)
-
-                print(f"Collected {len(scraped_posts)} posts. Idle scrolls: {no_new_posts_count}/100. Scrolling down...", end="\r")
-                page.keyboard.press("PageDown")
-                time.sleep(0.2)
-
-        except KeyboardInterrupt:
-            print("\n\n[!] Stop signal received (CTRL+C). Terminating collection...")
-        
-        finally:
-            print("\nSaving final JSON...")
-            save_json_data(scraped_posts)
-            
-            # Удаляем временный файл с куки
-            if os.path.exists(COOKIE_FILE):
-                try:
-                    os.remove(COOKIE_FILE)
-                except Exception:
-                    pass
-            
+        # --- POST HEADER ---
+        html_parts.append("<div class='header'>")
+        # For Discord or items with explicit author
+        if "author" in item:
+            html_parts.append(f"<span class='author'>{html.escape(item['author'])}</span>")
+        # Extract author for Bluesky posts from the URL
+        elif "url" in item and "bsky.app/profile/" in item["url"]:
+            parts = item["url"].split("/")
             try:
-                browser.close()
-            except Exception:
+                author = parts[parts.index("profile") + 1]
+                html_parts.append(f"<span class='author'>@{html.escape(author)}</span>")
+            except (ValueError, IndexError):
                 pass
-            
-            print(f"Process completed successfully! Total saved: {len(scraped_posts)} posts.")
+                
+        # Date
+        if "date" in item and item["date"]:
+            html_parts.append(f"<span class='date'>{html.escape(item['date'])}</span>")
+        # Link (for Twitter/Bluesky)
+        if "url" in item:
+            html_parts.append(f" | <a href='{item['url']}'>Original Link</a>")
+        html_parts.append("</div>")
 
+        # --- POST TEXT ---
+        if "text" in item and item["text"]:
+            safe_text = html.escape(item["text"])
+            html_parts.append(f"<div class='text'>{safe_text}</div>")
+
+        # --- MEDIA FILES ---
+        if "local_media" in item and item["local_media"]:
+            html_parts.append("<div class='media-grid'>")
+            for media_path in item["local_media"]:
+                if not os.path.exists(media_path):
+                    html_parts.append(f"<div class='video-label'>⚠️ File missing: {os.path.basename(media_path)}</div>")
+                    continue
+                
+                # Convert absolute path to file:/// URI for the browser
+                file_uri = Path(media_path).absolute().as_uri()
+                ext = media_path.lower().split('.')[-1]
+
+                if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                    # ИСПРАВЛЕНИЕ: Убрали loading='lazy'. Теперь картинки загружаются сразу,
+                    # и Playwright успеет их отрисовать для всех страниц перед созданием PDF.
+                    html_parts.append(f"<img src='{file_uri}'>")
+                else:
+                    html_parts.append(f"<div class='video-label'>🎥 Video/Attachment: {os.path.basename(media_path)}</div>")
+            
+            html_parts.append("</div>")
+
+        html_parts.append("</div>")
+
+    html_parts.append("</body></html>")
+    return "".join(html_parts)
+def convert_json_to_pdf(json_filename, pdf_filename):
+    print(f"[*] Reading file: {json_filename}...")
+    
+    try:
+        with open(json_filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"[!] Error: File {json_filename} not found.")
+        return
+    except json.JSONDecodeError:
+        print(f"[!] Error: File {json_filename} is corrupted.")
+        return
+
+    if not data:
+        print("[!] JSON is empty, no data to generate PDF.")
+        return
+
+    # 1. Generate HTML code
+    print("[*] Generating HTML layout...")
+    html_content = generate_html_content(data)
+    
+    temp_html_path = Path("temp_layout.html").absolute()
+    with open(temp_html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    # 2. Render PDF via Playwright
+    print(f"[*] Rendering PDF ({len(data)} entries), this may take a moment...")
+    try:
+        with sync_playwright() as p:
+            # Launch browser in headless mode
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            # Open local HTML file
+            page.goto(temp_html_path.as_uri(), wait_until="networkidle")
+            
+            # --- ИСПРАВЛЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ ---
+            print("[*] Forcing images to load and decode...")
+            page.evaluate("""
+                async () => {
+                    const images = document.querySelectorAll('img');
+                    for (const img of images) {
+                        // Ждем физической загрузки файла
+                        if (!img.complete) {
+                            await new Promise((resolve) => {
+                                img.onload = resolve;
+                                img.onerror = resolve;
+                            });
+                        }
+                        // Принудительно декодируем картинку в память, 
+                        // даже если она на 50-й странице
+                        try {
+                            await img.decode();
+                        } catch (e) {}
+                    }
+                }
+            """)
+            # --- ИСПРАВЛЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ---
+            
+            # Print to PDF
+            page.pdf(
+                path=pdf_filename,
+                format="A4",
+                print_background=True,
+                margin={"top": "20px", "bottom": "20px", "left": "20px", "right": "20px"}
+            )
+            browser.close()
+            
+        print(f"[+] Success! File saved as: {pdf_filename}")
+        
+    finally:
+        # Remove temporary HTML file
+        if os.path.exists(temp_html_path):
+            os.remove(temp_html_path)
 if __name__ == "__main__":
-    scrape_bookmarks_media()
+    print("=== Collected Data to PDF Converter ===")
+    print("1. Twitter (bookmarks.json -> twitter_bookmarks.pdf)")
+    print("2. Discord (disc_msgs.json -> discord_messages.pdf)")
+    print("3. Bluesky (bsky_bookmarks.json -> bsky_bookmarks.pdf)")
+    
+    choice = input("\nChoose a file for conversion (1, 2 or 3): ").strip()
+    file_name = input("Enter the JSON filename (with .json extension): ").strip()
+
+    if choice == "1":
+        convert_json_to_pdf(file_name, "twitter_bookmarks.pdf")
+    elif choice == "2":
+        convert_json_to_pdf(file_name, "discord_messages.pdf")
+    elif choice == "3":
+        convert_json_to_pdf(file_name, "bsky_bookmarks.pdf")
+    else:
+        print("Invalid choice.")
