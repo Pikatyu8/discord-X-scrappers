@@ -1,181 +1,154 @@
 import os
-import sys
-import time
 import json
-import requests
-from urllib.parse import urlparse
+import html
+from pathlib import Path
 from playwright.sync_api import sync_playwright
-from scrapling.parser import Selector
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from concurrent.futures import ThreadPoolExecutor
+from pypdf import PdfWriter  # Добавьте этот импорт (нужно установить: pip install pypdf)
 
-# --- Session Setup ---
-session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
-# Reduce retry attempts and use aggressive timeouts
-retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-session.mount('https://', HTTPAdapter(max_retries=retries))
+def generate_html_content(data):
+    """Generates HTML markup based on JSON data."""
+    html_parts =[
+        "<!DOCTYPE html>",
+        "<html><head><meta charset='utf-8'>",
+        "<style>",
+        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f5f6f8; }",
+        ".card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); page-break-inside: avoid; }",
+        ".header { color: #65676b; font-size: 14px; margin-bottom: 12px; border-bottom: 1px solid #eee; padding-bottom: 8px; }",
+        ".author { font-weight: bold; color: #1da1f2; margin-right: 8px; }",
+        ".date { color: #888; }",
+        ".text { font-size: 15px; line-height: 1.5; white-space: pre-wrap; margin-bottom: 15px; word-wrap: break-word; color: #0f1419; }",
+        ".media-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }",
+        ".media-grid img { max-width: 100%; max-height: 500px; border-radius: 8px; border: 1px solid #eee; object-fit: contain; }",
+        ".video-label { display: inline-block; padding: 8px 12px; background: #e1e8ed; border-radius: 6px; font-size: 13px; color: #14171a; margin-top: 5px; }",
+        "a { color: #1da1f2; text-decoration: none; } a:hover { text-decoration: underline; }",
+        "</style></head><body>"
+    ]
 
-def get_chrome_testing_user_data_dir():
-    """Determines the path to the Chrome for Testing profile."""
-    if sys.platform == "win32":
-        return os.path.join(os.environ["LOCALAPPDATA"], "Google", "Chrome for Testing", "User Data")
-    elif sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/Google/Chrome for Testing")
-    else:
-        return os.path.expanduser("~/.config/google-chrome-for-testing")
+    for item in data:
+        html_parts.append("<div class='card'>")
+        html_parts.append("<div class='header'>")
+        if "author" in item:
+            html_parts.append(f"<span class='author'>{html.escape(item['author'])}</span>")
+        elif "url" in item and "bsky.app/profile/" in item["url"]:
+            parts = item["url"].split("/")
+            try:
+                author = parts[parts.index("profile") + 1]
+                html_parts.append(f"<span class='author'>@{html.escape(author)}</span>")
+            except (ValueError, IndexError):
+                pass
+        if "date" in item and item["date"]:
+            html_parts.append(f"<span class='date'>{html.escape(item['date'])}</span>")
+        if "url" in item:
+            html_parts.append(f" | <a href='{item['url']}'>Original Link</a>")
+        html_parts.append("</div>")
 
-def download_media(url, save_path):
-    """Downloads a media file via a direct link with a short timeout."""
+        if "text" in item and item["text"]:
+            safe_text = html.escape(item["text"])
+            html_parts.append(f"<div class='text'>{safe_text}</div>")
+
+        if "local_media" in item and item["local_media"]:
+            html_parts.append("<div class='media-grid'>")
+            for media_path in item["local_media"]:
+                if not os.path.exists(media_path):
+                    html_parts.append(f"<div class='video-label'>⚠️ File missing: {os.path.basename(media_path)}</div>")
+                    continue
+                file_uri = Path(media_path).absolute().as_uri()
+                ext = media_path.lower().split('.')[-1]
+                if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                    html_parts.append(f"<img src='{file_uri}'>")
+                else:
+                    html_parts.append(f"<div class='video-label'>🎥 Video/Attachment: {os.path.basename(media_path)}</div>")
+            html_parts.append("</div>")
+        html_parts.append("</div>")
+
+    html_parts.append("</body></html>")
+    return "".join(html_parts)
+
+def convert_json_to_pdf(json_filename, pdf_filename):
+    print(f"[*] Reading file: {json_filename}...")
     try:
-        # timeout=(3, 7): 3s for connection (resolves dead DNS), 7s for download
-        response = session.get(url, stream=True, timeout=(3, 7))
-        response.raise_for_status()
-        with open(save_path, 'wb') as f:
-            for chunk in response.iter_content(8192):
-                f.write(chunk)
-    except Exception:
-        # Ignore errors (broken links, dead CDNs) to avoid console spam
-        pass
+        with open(json_filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[!] Error: {e}")
+        return
 
-def save_json_data(scraped_msgs):
-    """Dynamically save data to JSON."""
-    sorted_msgs = sorted(scraped_msgs.values(), key=lambda x: int(x["id"]))
-    with open("disc_msgs.json", "w", encoding="utf-8") as f:
-        json.dump(sorted_msgs, f, ensure_ascii=False, indent=4)
+    if not data:
+        print("[!] JSON is empty.")
+        return
 
-def scrape_discord_messages():
-    MEDIA_DIR = "./media"
-    os.makedirs(MEDIA_DIR, exist_ok=True)
-
-    TARGET_URL = "https://discord.com/channels/@me" 
-    
-    # Thread pool for background media downloading (up to 10 files simultaneously)
-    executor = ThreadPoolExecutor(max_workers=10)
+    # Настройки батчинга (по 400 записей за раз, чтобы не превысить лимит 512МБ)
+    BATCH_SIZE = 400
+    temp_pdfs = []
     
     with sync_playwright() as p:
-        executable_path = p.chromium.executable_path
-        user_data_dir = get_chrome_testing_user_data_dir()
+        browser = p.chromium.launch(headless=True)
         
-        print(f"Launching Chrome with profile: {user_data_dir}")
-        browser = p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            executable_path=executable_path,
-            headless=False,
-            args=["--start-maximized"],
-            no_viewport=True,
-        )
-        
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        page.goto(TARGET_URL, wait_until="domcontentloaded")
-        
-        input("Press Enter once you have opened the desired chat to start collecting...")
-        
-        scraped_msgs = {} 
-        no_new_msgs_count = 0
-        previous_count = 0
-        current_author = "Unknown"
-
-        page.locator('[data-list-id="chat-messages"]').click()
-        print("\n=== Collection started. Press CTRL+C to stop ===")
-
-        try:
-            while True:
-                html_content = page.content()
-                selector = Selector(html_content)
-                messages = selector.css('li[class*="messageListItem_"]')
-                
-                new_messages_in_batch = False
-
-                for msg in messages:
-                    msg_id_attr = msg.css('::attr(id)').get()
-                    if not msg_id_attr or "chat-messages-" not in msg_id_attr:
-                        continue
-                    
-                    msg_id = msg_id_attr.split('-')[-1]
-
-                    if msg_id in scraped_msgs:
-                        continue
-
-                    # Author detection
-                    author_elem = msg.css('span[class*="username_"] ::text').getall()
-                    if author_elem:
-                        current_author = "".join(author_elem).strip()
-
-                    text_parts = msg.css('div[class*="messageContent_"] ::text').getall()
-                    full_text = "".join(text_parts).strip()
-                    date = msg.css('time::attr(datetime)').get()
-
-                    # Media detection
-                    media_urls = []
-                    media_urls.extend(msg.css('a[class*="originalLink_"]::attr(href)').getall())
-                    media_urls.extend(msg.css('video::attr(src)').getall())
-                    media_urls = list(set(media_urls))
-                    
-                    local_media_paths = []
-
-                    for url in media_urls:
-                        parsed_url = urlparse(url)
-                        filename = os.path.basename(parsed_url.path)
-                        if not filename:
-                            filename = f"media_{msg_id}.dat"
-                            
-                        save_filename = f"{msg_id}_{filename}"
-                        filepath = os.path.join(MEDIA_DIR, save_filename)
-                        local_media_paths.append(os.path.abspath(filepath))
-                        
-                        # --- AVAILABILITY CHECK AND BACKGROUND DOWNLOAD ---
-                        if not os.path.exists(filepath):
-                            # Send to background; the script does not wait for the download to finish!
-                            executor.submit(download_media, url, filepath)
-
-                    scraped_msgs[msg_id] = {
-                        "id": msg_id,
-                        "author": current_author,
-                        "date": date,
-                        "text": full_text,
-                        "local_media": local_media_paths
+        for i in range(0, len(data), BATCH_SIZE):
+            batch = data[i : i + BATCH_SIZE]
+            batch_idx = (i // BATCH_SIZE) + 1
+            print(f"[*] Processing batch {batch_idx} ({len(batch)} entries)...")
+            
+            html_content = generate_html_content(batch)
+            temp_html = Path(f"temp_{batch_idx}.html").absolute()
+            temp_pdf = f"temp_{batch_idx}.pdf"
+            
+            with open(temp_html, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            
+            page = browser.new_page()
+            page.goto(temp_html.as_uri(), wait_until="networkidle")
+            
+            # Принудительная загрузка картинок
+            page.evaluate("""
+                async () => {
+                    const images = document.querySelectorAll('img');
+                    for (const img of images) {
+                        if (!img.complete) {
+                            await new Promise((r) => { img.onload = r; img.onerror = r; });
+                        }
+                        try { await img.decode(); } catch (e) {}
                     }
-                    new_messages_in_batch = True
+                }
+            """)
+            
+            page.pdf(
+                path=temp_pdf,
+                format="A4",
+                print_background=True,
+                margin={"top": "20px", "bottom": "20px", "left": "20px", "right": "20px"}
+            )
+            page.close()
+            
+            temp_pdfs.append(temp_pdf)
+            os.remove(temp_html)
 
-                # Scroll up and check limit
-                if len(scraped_msgs) == previous_count:
-                    no_new_msgs_count += 1
-                    if no_new_msgs_count >= 500:
-                        print("\n[!] 500 scrolls with no new messages. Limit reached (start of chat). Auto-stopping.")
-                        break
-                else:
-                    no_new_msgs_count = 0
-                    
-                previous_count = len(scraped_msgs)
-                
-                # Dynamically save JSON if new messages were found
-                if new_messages_in_batch:
-                    save_json_data(scraped_msgs)
-                
-                print(f"Collected {len(scraped_msgs)} messages. Idle scrolls: {no_new_msgs_count}/500. Scrolling up...", end="\r")
-                
-                page.keyboard.press("PageUp")
-                time.sleep(2)
-                
-        except KeyboardInterrupt:
-            print("\n\n[!] Stop signal received (CTRL+C). Terminating collection...")
-        finally:
-            print("\nWaiting for background downloads to finish, please wait a few seconds...")
-            # Wait for background download threads (to prevent file corruption)
-            executor.shutdown(wait=True)
+        browser.close()
+
+    # Склеивание всех частей в один файл
+    print(f"[*] Merging {len(temp_pdfs)} PDF parts...")
+    merger = PdfWriter()
+    for pdf in temp_pdfs:
+        merger.append(pdf)
+    
+    final_output = f"{pdf_filename}.pdf" if not pdf_filename.endswith(".pdf") else pdf_filename
+    merger.write(final_output)
+    merger.close()
+
+    # Удаление временных PDF
+    for pdf in temp_pdfs:
+        if os.path.exists(pdf):
+            os.remove(pdf)
             
-            print("Saving final JSON...")
-            save_json_data(scraped_msgs)
-            
-            # Suppress browser closure errors (useful during CTRL+C)
-            try:
-                browser.close()
-            except Exception:
-                pass
-            
-            print("Process completed successfully!")
+    print(f"[+] Success! Final file: {final_output}")
 
 if __name__ == "__main__":
-    scrape_discord_messages()
+    print("=== Collected Data to PDF Converter ===")
+    print("1. Twitter (bookmarks.json -> twitter_bookmarks.pdf)")
+    print("2. Discord (disc_msgs.json -> discord_messages.pdf)")
+    print("3. Bluesky (bsky_bookmarks.json -> bsky_bookmarks.pdf)")
+    
+    choice = input("\nChoose a file for conversion (1, 2 or 3): ").strip()
+    file_name = input("Enter the JSON filename (with .json extension): ").strip()
+
+    convert_json_to_pdf(file_name, file_name)
