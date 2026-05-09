@@ -17,8 +17,8 @@ def generate_html_content(data):
         ".author { font-weight: bold; color: #1da1f2; margin-right: 8px; }",
         ".date { color: #888; }",
         ".text { font-size: 15px; line-height: 1.5; white-space: pre-wrap; margin-bottom: 15px; word-wrap: break-word; color: #0f1419; }",
-        ".media-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }",
-        ".media-grid img { max-width: 100%; max-height: 400px; border-radius: 8px; border: 1px solid #eee; object-fit: contain; }",
+        ".media-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }",
+        ".media-grid img { max-width: 100%; max-height: 500px; border-radius: 8px; border: 1px solid #eee; object-fit: contain; }",
         ".video-label { display: inline-block; padding: 8px 12px; background: #e1e8ed; border-radius: 6px; font-size: 13px; color: #14171a; margin-top: 5px; }",
         "a { color: #1da1f2; text-decoration: none; } a:hover { text-decoration: underline; }",
         "</style></head><body>"
@@ -36,7 +36,6 @@ def generate_html_content(data):
         elif "url" in item and "bsky.app/profile/" in item["url"]:
             parts = item["url"].split("/")
             try:
-                # Извлекаем никнейм сразу после /profile/
                 author = parts[parts.index("profile") + 1]
                 html_parts.append(f"<span class='author'>@{html.escape(author)}</span>")
             except (ValueError, IndexError):
@@ -52,7 +51,6 @@ def generate_html_content(data):
 
         # --- POST TEXT ---
         if "text" in item and item["text"]:
-            # html.escape prevents layout breakage if the text contains < or >
             safe_text = html.escape(item["text"])
             html_parts.append(f"<div class='text'>{safe_text}</div>")
 
@@ -68,8 +66,10 @@ def generate_html_content(data):
                 file_uri = Path(media_path).absolute().as_uri()
                 ext = media_path.lower().split('.')[-1]
 
-                if ext in['jpg', 'jpeg', 'png', 'gif', 'webp']:
-                    html_parts.append(f"<img src='{file_uri}' loading='lazy'>")
+                if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                    # ИСПРАВЛЕНИЕ: Убрали loading='lazy'. Теперь картинки загружаются сразу,
+                    # и Playwright успеет их отрисовать для всех страниц перед созданием PDF.
+                    html_parts.append(f"<img src='{file_uri}'>")
                 else:
                     html_parts.append(f"<div class='video-label'>🎥 Video/Attachment: {os.path.basename(media_path)}</div>")
             
@@ -79,8 +79,6 @@ def generate_html_content(data):
 
     html_parts.append("</body></html>")
     return "".join(html_parts)
-
-
 def convert_json_to_pdf(json_filename, pdf_filename):
     print(f"[*] Reading file: {json_filename}...")
     
@@ -117,6 +115,29 @@ def convert_json_to_pdf(json_filename, pdf_filename):
             # Open local HTML file
             page.goto(temp_html_path.as_uri(), wait_until="networkidle")
             
+            # --- ИСПРАВЛЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ ---
+            print("[*] Forcing images to load and decode...")
+            page.evaluate("""
+                async () => {
+                    const images = document.querySelectorAll('img');
+                    for (const img of images) {
+                        // Ждем физической загрузки файла
+                        if (!img.complete) {
+                            await new Promise((resolve) => {
+                                img.onload = resolve;
+                                img.onerror = resolve;
+                            });
+                        }
+                        // Принудительно декодируем картинку в память, 
+                        // даже если она на 50-й странице
+                        try {
+                            await img.decode();
+                        } catch (e) {}
+                    }
+                }
+            """)
+            # --- ИСПРАВЛЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ---
+            
             # Print to PDF
             page.pdf(
                 path=pdf_filename,
@@ -132,8 +153,6 @@ def convert_json_to_pdf(json_filename, pdf_filename):
         # Remove temporary HTML file
         if os.path.exists(temp_html_path):
             os.remove(temp_html_path)
-
-
 if __name__ == "__main__":
     print("=== Collected Data to PDF Converter ===")
     print("1. Twitter (bookmarks.json -> twitter_bookmarks.pdf)")
