@@ -10,14 +10,15 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor
 
-# --- Настройка сессии ---
+# --- Session Setup ---
 session = requests.Session()
-# Сокращаем количество попыток и делаем агрессивный таймаут
+session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
+# Reduce retry attempts and use aggressive timeouts
 retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def get_chrome_testing_user_data_dir():
-    """Определяет путь к профилю Chrome for Testing."""
+    """Determines the path to the Chrome for Testing profile."""
     if sys.platform == "win32":
         return os.path.join(os.environ["LOCALAPPDATA"], "Google", "Chrome for Testing", "User Data")
     elif sys.platform == "darwin":
@@ -26,20 +27,20 @@ def get_chrome_testing_user_data_dir():
         return os.path.expanduser("~/.config/google-chrome-for-testing")
 
 def download_media(url, save_path):
-    """Скачивает медиафайл по прямой ссылке с коротким таймаутом."""
+    """Downloads a media file via a direct link with a short timeout."""
     try:
-        # timeout=(3, 7): 3 секунды на подключение (решает проблему мертвых DNS), 7 секунд на скачивание
+        # timeout=(3, 7): 3s for connection (resolves dead DNS), 7s for download
         response = session.get(url, stream=True, timeout=(3, 7))
         response.raise_for_status()
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(8192):
                 f.write(chunk)
     except Exception:
-        # Игнорируем ошибки (битые ссылки, мертвые CDN), чтобы не спамить в консоль
+        # Ignore errors (broken links, dead CDNs) to avoid console spam
         pass
 
 def save_json_data(scraped_msgs):
-    """Динамическое сохранение данных в JSON."""
+    """Dynamically save data to JSON."""
     sorted_msgs = sorted(scraped_msgs.values(), key=lambda x: int(x["id"]))
     with open("disc_msgs.json", "w", encoding="utf-8") as f:
         json.dump(sorted_msgs, f, ensure_ascii=False, indent=4)
@@ -50,14 +51,14 @@ def scrape_discord_messages():
 
     TARGET_URL = "https://discord.com/channels/@me" 
     
-    # Пул потоков для фоновой загрузки медиа (до 10 файлов одновременно)
+    # Thread pool for background media downloading (up to 10 files simultaneously)
     executor = ThreadPoolExecutor(max_workers=10)
     
     with sync_playwright() as p:
         executable_path = p.chromium.executable_path
         user_data_dir = get_chrome_testing_user_data_dir()
         
-        print(f"Запускаю Chrome с профилем: {user_data_dir}")
+        print(f"Launching Chrome with profile: {user_data_dir}")
         browser = p.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
             executable_path=executable_path,
@@ -69,7 +70,7 @@ def scrape_discord_messages():
         page = browser.pages[0] if browser.pages else browser.new_page()
         page.goto(TARGET_URL, wait_until="domcontentloaded")
         
-        input("Нажмите Enter, когда откроете нужный чат для начала сбора...")
+        input("Press Enter once you have opened the desired chat to start collecting...")
         
         scraped_msgs = {} 
         no_new_msgs_count = 0
@@ -77,7 +78,7 @@ def scrape_discord_messages():
         current_author = "Unknown"
 
         page.locator('[data-list-id="chat-messages"]').click()
-        print("\n=== Начинаю сбор. Для завершения работы нажмите CTRL+C ===")
+        print("\n=== Collection started. Press CTRL+C to stop ===")
 
         try:
             while True:
@@ -97,7 +98,7 @@ def scrape_discord_messages():
                     if msg_id in scraped_msgs:
                         continue
 
-                    # Обнаружение автора
+                    # Author detection
                     author_elem = msg.css('span[class*="username_"] ::text').getall()
                     if author_elem:
                         current_author = "".join(author_elem).strip()
@@ -106,13 +107,13 @@ def scrape_discord_messages():
                     full_text = "".join(text_parts).strip()
                     date = msg.css('time::attr(datetime)').get()
 
-                    # Обнаружение медиа
-                    media_urls =[]
+                    # Media detection
+                    media_urls = []
                     media_urls.extend(msg.css('a[class*="originalLink_"]::attr(href)').getall())
                     media_urls.extend(msg.css('video::attr(src)').getall())
                     media_urls = list(set(media_urls))
                     
-                    local_media_paths =[]
+                    local_media_paths = []
 
                     for url in media_urls:
                         parsed_url = urlparse(url)
@@ -124,9 +125,9 @@ def scrape_discord_messages():
                         filepath = os.path.join(MEDIA_DIR, save_filename)
                         local_media_paths.append(os.path.abspath(filepath))
                         
-                        # --- ПРОВЕРКА НАЛИЧИЯ И ФОНОВАЯ ЗАГРУЗКА ---
+                        # --- AVAILABILITY CHECK AND BACKGROUND DOWNLOAD ---
                         if not os.path.exists(filepath):
-                            # Отправляем в фон, скрипт не ждет завершения загрузки!
+                            # Send to background; the script does not wait for the download to finish!
                             executor.submit(download_media, url, filepath)
 
                     scraped_msgs[msg_id] = {
@@ -138,43 +139,43 @@ def scrape_discord_messages():
                     }
                     new_messages_in_batch = True
 
-                # Листаем вверх и проверяем лимит
+                # Scroll up and check limit
                 if len(scraped_msgs) == previous_count:
                     no_new_msgs_count += 1
-                    if no_new_msgs_count >= 100:
-                        print("\n[!] 100 прокруток без новых сообщений. Достигнут лимит (начало чата). Авто-остановка.")
+                    if no_new_msgs_count >= 500:
+                        print("\n[!] 500 scrolls with no new messages. Limit reached (start of chat). Auto-stopping.")
                         break
                 else:
                     no_new_msgs_count = 0
                     
                 previous_count = len(scraped_msgs)
                 
-                # Динамически сохраняем JSON при наличии новых сообщений
+                # Dynamically save JSON if new messages were found
                 if new_messages_in_batch:
                     save_json_data(scraped_msgs)
                 
-                print(f"Собрано {len(scraped_msgs)} сообщений. Прокруток без результата: {no_new_msgs_count}/100. Листаю вверх...", end="\r")
+                print(f"Collected {len(scraped_msgs)} messages. Idle scrolls: {no_new_msgs_count}/500. Scrolling up...", end="\r")
                 
                 page.keyboard.press("PageUp")
                 time.sleep(2)
                 
         except KeyboardInterrupt:
-            print("\n\n[!] Получен сигнал остановки (CTRL+C). Завершаю сбор...")
+            print("\n\n[!] Stop signal received (CTRL+C). Terminating collection...")
         finally:
-            print("\nФоновые загрузки завершаются, подождите пару секунд...")
-            # Ждем завершения фоновых потоков загрузки (чтобы файлы не побились)
+            print("\nWaiting for background downloads to finish, please wait a few seconds...")
+            # Wait for background download threads (to prevent file corruption)
             executor.shutdown(wait=True)
             
-            print("Сохраняю финальный JSON...")
+            print("Saving final JSON...")
             save_json_data(scraped_msgs)
             
-            # Гасим ошибку закрытия браузера (полезно при CTRL+C)
+            # Suppress browser closure errors (useful during CTRL+C)
             try:
                 browser.close()
             except Exception:
                 pass
             
-            print("Работа успешно завершена!")
+            print("Process completed successfully!")
 
 if __name__ == "__main__":
     scrape_discord_messages()
