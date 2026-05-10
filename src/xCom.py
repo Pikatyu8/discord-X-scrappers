@@ -16,6 +16,7 @@ from urllib3.util.retry import Retry
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
+EXTENSION_PATH = os.path.abspath("./ext/InsensitiveX")
 
 # Блокировка для безопасного сохранения JSON из фоновых потоков
 json_lock = threading.Lock()
@@ -98,14 +99,22 @@ def scrape_bookmarks_media():
         user_data_dir = get_chrome_testing_user_data_dir()
         
         print(f"Launching Chrome with profile: {user_data_dir}")
+        
         browser = p.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
             executable_path=executable_path,
             headless=False,
-            args=["--start-maximized"],
             no_viewport=True,
-        )
-        
+            # ВАЖНО: Добавляем эти аргументы
+            args=[
+                "--start-maximized",
+                # Указываем путь к расширению
+                f"--disable-extensions-except={EXTENSION_PATH}",
+                f"--load-extension={EXTENSION_PATH}",
+            ],
+            # По умолчанию Playwright может отключать расширения, разрешаем их:
+            ignore_default_args=["--disable-extensions"] 
+        )        
         page = browser.pages[0] if browser.pages else browser.new_page()
         
         # --- ШАГ 1: ОЖИДАНИЕ ПОЛЬЗОВАТЕЛЯ ---
@@ -223,11 +232,11 @@ def scrape_bookmarks_media():
                         print(f"\n[+] Queueing background video download: {post_url}")
                         executor.submit(download_video_async, post_url, tweet_id, COOKIE_FILE, MEDIA_DIR, scraped_posts)
 
-                # Логика выхода (100 скроллов безрезультатно)
+                # Логика выхода (500 скроллов безрезультатно)
                 if len(scraped_posts) == previous_count:
                     no_new_posts_count += 1
-                    if no_new_posts_count >= 100:
-                        print("\n\n[!] 100 scrolls with no new posts. Limit reached (end of feed). Auto-stopping.")
+                    if no_new_posts_count >= 500:
+                        print("\n\n[!] 500 scrolls with no new posts. Limit reached (end of feed). Auto-stopping.")
                         break
                 else:
                     no_new_posts_count = 0
@@ -238,7 +247,7 @@ def scrape_bookmarks_media():
                 if new_posts_in_batch:
                     save_json_data(scraped_posts)
 
-                print(f"Collected {len(scraped_posts)} posts. Idle scrolls: {no_new_posts_count}/100. Scrolling down...", end="\r")
+                print(f"Collected {len(scraped_posts)} posts. Idle scrolls: {no_new_posts_count}/500. Scrolling down...", end="\r")
                 page.keyboard.press("PageDown")
                 time.sleep(0.2)
 
