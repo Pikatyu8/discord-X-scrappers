@@ -178,14 +178,30 @@ def scrape_bookmarks_media():
                         if not video_exists:
                             video_filename_template = f"{MEDIA_DIR}/{post_id}_video.%(ext)s"
                             print(f"\n[+] Downloading video: {post_url}")
-                            cmd =["yt-dlp", "--cookies", COOKIE_FILE, "-o", video_filename_template, post_url]
+                            
+                            # Добавляем флаги --socket-timeout и --retries для быстрого сброса
+                            cmd =[
+                                "yt-dlp", 
+                                "--cookies", COOKIE_FILE, 
+                                "--socket-timeout", "10", 
+                                "--retries", "1", 
+                                "-o", video_filename_template, 
+                                post_url
+                            ]
+                            
                             try:
-                                subprocess.run(cmd, check=True, capture_output=True)
+                                # Добавляем жесткий таймаут 30 секунд на весь процесс скачивания
+                                subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+                                
                                 for file in os.listdir(MEDIA_DIR):
                                     if file.startswith(f"{post_id}_video"):
                                         local_media_paths.append(os.path.abspath(os.path.join(MEDIA_DIR, file)))
+                            
+                            except subprocess.TimeoutExpired:
+                                print(f"\n[!] yt-dlp timed out (>30s) and was skipped for {post_url}")
                             except Exception as e:
-                                print(f"\n[!] yt-dlp error for {post_url}: {e}")
+                                print(f"\n[!] yt-dlp error for {post_url} (skipped)")
+                                print(f"Error details: {e}")
 
                     for idx, img_url in enumerate(img_urls):
                         ext = "jpg"
