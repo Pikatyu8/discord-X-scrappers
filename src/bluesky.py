@@ -12,7 +12,7 @@ from urllib3.util.retry import Retry
 
 # --- Session setup for stable image downloads ---
 session = requests.Session()
-retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def get_chrome_testing_user_data_dir():
@@ -28,7 +28,7 @@ def download_image(url, save_path):
     """Downloads an image in maximum quality (fullsize for Bluesky)."""
     url = url.replace('/feed_thumbnail/', '/feed_fullsize/')
     try:
-        response = session.get(url, stream=True, timeout=30)
+        response = session.get(url, stream=True, timeout=10)
         response.raise_for_status()
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(8192):
