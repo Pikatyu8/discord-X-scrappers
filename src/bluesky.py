@@ -5,6 +5,8 @@ import json
 import requests
 import subprocess
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright
 from scrapling.parser import Selector
 from requests.adapters import HTTPAdapter
@@ -12,8 +14,11 @@ from urllib3.util.retry import Retry
 
 # --- Session setup for stable image downloads ---
 session = requests.Session()
-retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
+
+# Блокировка для безопасного сохранения JSON из фоновых потоков
+json_lock = threading.Lock()
 
 def get_chrome_testing_user_data_dir():
     """Determines the path to the Chrome for Testing profile directory."""
@@ -28,7 +33,7 @@ def download_image(url, save_path):
     """Downloads an image in maximum quality (fullsize for Bluesky)."""
     url = url.replace('/feed_thumbnail/', '/feed_fullsize/')
     try:
-        response = session.get(url, stream=True, timeout=10)
+        response = session.get(url, stream=True, timeout=30)
         response.raise_for_status()
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(8192):
@@ -39,9 +44,10 @@ def download_image(url, save_path):
         return False
 
 def save_json_data(scraped_posts):
-    """Dynamically save data to JSON."""
-    with open("bsky_bookmarks.json", "w", encoding="utf-8") as f:
-        json.dump(list(scraped_posts.values()), f, ensure_ascii=False, indent=4)
+    """Dynamically save data to JSON. Thread-safe."""
+    with json_lock:
+        with open("bsky_bookmarks.json", "w", encoding="utf-8") as f:
+            json.dump(list(scraped_posts.values()), f, ensure_ascii=False, indent=4)
 
 def load_json_data():
     """Loads existing data to prevent re-processing."""
@@ -54,10 +60,33 @@ def load_json_data():
             print(f"Error loading existing JSON: {e}")
     return {}
 
+def download_video_async(post_url, post_id, cookie_file, media_dir, scraped_posts):
+    """Background task for downloading videos via yt-dlp."""
+    video_filename_template = f"{media_dir}/{post_id}_video.%(ext)s"
+    cmd =["yt-dlp", "--cookies", cookie_file, "-o", video_filename_template, post_url]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        # Ищем скачанный файл (yt-dlp мог задать ему расширение .mp4, .webm и т.д.)
+        for file in os.listdir(media_dir):
+            if file.startswith(f"{post_id}_video") and not file.endswith('.part') and not file.endswith('.ytdl'):
+                file_path = os.path.abspath(os.path.join(media_dir, file))
+                # Добавляем путь в общий словарь, если его там еще нет
+                if file_path not in scraped_posts[post_url]["local_media"]:
+                    scraped_posts[post_url]["local_media"].append(file_path)
+        
+        # Сохраняем обновленный JSON
+        save_json_data(scraped_posts)
+        print(f"\n[+] Background video download finished: {post_url}")
+    except Exception as e:
+        print(f"\n[!] Background yt-dlp error for {post_url}: {e}")
+
 def scrape_bookmarks_media():
     MEDIA_DIR = "./media"
     COOKIE_FILE = "bsky_cookies.txt"
     os.makedirs(MEDIA_DIR, exist_ok=True)
+    
+    # Создаем пул потоков (максимум 3 одновременных загрузки видео)
+    executor = ThreadPoolExecutor(max_workers=3)
     
     # Загружаем уже собранные посты
     scraped_posts = load_json_data()
@@ -122,7 +151,6 @@ def scrape_bookmarks_media():
         try:
             while True:
                 # ВМЕСТО page.content() мы просим браузер найти только НОВЫЕ (еще не обработанные) посты
-                # Это полностью убирает лаги при скролле огромных лент.
                 new_posts_html = page.evaluate('''() => {
                     const posts = document.querySelectorAll('[data-testid^="feedItem-by-"]:not([data-scraped="true"])');
                     const results =[];
@@ -135,7 +163,6 @@ def scrape_bookmarks_media():
                 
                 new_posts_in_batch = False
 
-                # Теперь парсер работает только с 10-20 новыми постами, а не с 1200+
                 for post_html in new_posts_html:
                     post = Selector(post_html)
                     
@@ -166,42 +193,14 @@ def scrape_bookmarks_media():
 
                     local_media_paths =[]
 
+                    # ПРОВЕРКА: скачивали ли мы уже это видео (ищем файл начинающийся на {post_id}_video)
+                    video_exists = False
                     if has_video:
-                        # ПРОВЕРКА: скачивали ли мы уже это видео (ищем файл начинающийся на {post_id}_video)
-                        video_exists = False
                         for file in os.listdir(MEDIA_DIR):
-                            if file.startswith(f"{post_id}_video"):
+                            if file.startswith(f"{post_id}_video") and not file.endswith('.part') and not file.endswith('.ytdl'):
                                 video_exists = True
                                 local_media_paths.append(os.path.abspath(os.path.join(MEDIA_DIR, file)))
                                 break
-                                
-                        if not video_exists:
-                            video_filename_template = f"{MEDIA_DIR}/{post_id}_video.%(ext)s"
-                            print(f"\n[+] Downloading video: {post_url}")
-                            
-                            # Добавляем флаги --socket-timeout и --retries для быстрого сброса
-                            cmd =[
-                                "yt-dlp", 
-                                "--cookies", COOKIE_FILE, 
-                                "--socket-timeout", "10", 
-                                "--retries", "1", 
-                                "-o", video_filename_template, 
-                                post_url
-                            ]
-                            
-                            try:
-                                # Добавляем жесткий таймаут 30 секунд на весь процесс скачивания
-                                subprocess.run(cmd, check=True, capture_output=True, timeout=30)
-                                
-                                for file in os.listdir(MEDIA_DIR):
-                                    if file.startswith(f"{post_id}_video"):
-                                        local_media_paths.append(os.path.abspath(os.path.join(MEDIA_DIR, file)))
-                            
-                            except subprocess.TimeoutExpired:
-                                print(f"\n[!] yt-dlp timed out (>30s) and was skipped for {post_url}")
-                            except Exception as e:
-                                print(f"\n[!] yt-dlp error for {post_url} (skipped)")
-                                print(f"Error details: {e}")
 
                     for idx, img_url in enumerate(img_urls):
                         ext = "jpg"
@@ -215,6 +214,7 @@ def scrape_bookmarks_media():
                             if download_image(img_url, filepath):
                                 local_media_paths.append(os.path.abspath(filepath))
 
+                    # Создаем запись в словаре СРАЗУ, чтобы фоновый поток мог добавить в нее скачанное видео позже
                     scraped_posts[post_url] = {
                         "url": post_url,
                         "date": date or "Unknown",
@@ -222,6 +222,11 @@ def scrape_bookmarks_media():
                         "local_media": local_media_paths
                     }
                     new_posts_in_batch = True
+
+                    # Отправляем видео на скачивание в фоне (не блокирует скроллинг)
+                    if has_video and not video_exists:
+                        print(f"\n[+] Queueing background video download: {post_url}")
+                        executor.submit(download_video_async, post_url, post_id, COOKIE_FILE, MEDIA_DIR, scraped_posts)
 
                 # Логика выхода (100 скроллов безрезультатно)
                 if len(scraped_posts) == previous_count:
@@ -260,6 +265,8 @@ def scrape_bookmarks_media():
                 pass
             
             print(f"Process completed successfully! Total saved: {len(scraped_posts)} posts.")
+            print("Waiting for background video downloads to finish (if any)... Press CTRL+C again to force quit.")
+            executor.shutdown(wait=True)
 
 if __name__ == "__main__":
     scrape_bookmarks_media()
