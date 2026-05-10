@@ -1,0 +1,26 @@
+{
+"update_url": "https://clients2.google.com/service/update2/crx",
+
+	"manifest_version": 3,
+	"name": "InsensitiveX",
+	"version": "1.0",
+	"description": "Allows watching sensitive media on X (formely known as Twitter) for all accounts",
+	"icons": {
+		"16": "logo/thumb_16.png",
+		"128": "logo/thumb_128.png"
+	},
+	"permissions": [],
+	"host_permissions": [
+		"https://x.com/*"
+	],
+	"content_scripts": [
+		{
+			"matches": [
+				"https://x.com/*"
+			],
+			"js": ["patch.js"],
+			"run_at": "document_start",
+			"world": "MAIN"
+		}
+	]
+}
