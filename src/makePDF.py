@@ -1,13 +1,49 @@
+# src/makePDF.py
 import os
 import json
 import html
+import base64
+from io import BytesIO
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from pypdf import PdfWriter  # Добавьте этот импорт (нужно установить: pip install pypdf)
+from pypdf import PdfWriter
+
+try:
+    from PIL import Image
+except ImportError:
+    print("[!] PIL is required. Install it: pip install Pillow")
+    exit(1)
+
+def get_compressed_image_b64(image_path, max_width=800):
+    """Сжимает изображение и возвращает base64-строку."""
+    try:
+        with Image.open(image_path) as img:
+            if img.mode in ("RGBA", "P", "LA"):
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "RGBA":
+                    background.paste(img, mask=img.split()[3])
+                else:
+                    background.paste(img)
+                img = background
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_size = (max_width, int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+            buffer = BytesIO()
+            img.save(buffer, format="JPEG", quality=75, optimize=True)
+            b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            return f"data:image/jpeg;base64,{b64_str}"
+    except Exception as e:
+        print(f"[!] Error compressing image {os.path.basename(image_path)}: {e}")
+        return None
 
 def generate_html_content(data):
-    """Generates HTML markup based on JSON data."""
-    html_parts =[
+    """Формирует HTML разметку на базе входного массива."""
+    html_parts = [
         "<!DOCTYPE html>",
         "<html><head><meta charset='utf-8'>",
         "<style>",
@@ -43,8 +79,7 @@ def generate_html_content(data):
         html_parts.append("</div>")
 
         if "text" in item and item["text"]:
-            safe_text = html.escape(item["text"])
-            html_parts.append(f"<div class='text'>{safe_text}</div>")
+            html_parts.append(f"<div class='text'>{html.escape(item['text'])}</div>")
 
         if "local_media" in item and item["local_media"]:
             html_parts.append("<div class='media-grid'>")
@@ -52,10 +87,15 @@ def generate_html_content(data):
                 if not os.path.exists(media_path):
                     html_parts.append(f"<div class='video-label'>⚠️ File missing: {os.path.basename(media_path)}</div>")
                     continue
-                file_uri = Path(media_path).absolute().as_uri()
+                
                 ext = media_path.lower().split('.')[-1]
                 if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
-                    html_parts.append(f"<img src='{file_uri}'>")
+                    b64_img = get_compressed_image_b64(media_path)
+                    if b64_img:
+                        html_parts.append(f"<img src='{b64_img}'>")
+                    else:
+                        file_uri = Path(media_path).absolute().as_uri()
+                        html_parts.append(f"<img src='{file_uri}'>")
                 else:
                     html_parts.append(f"<div class='video-label'>🎥 Video/Attachment: {os.path.basename(media_path)}</div>")
             html_parts.append("</div>")
@@ -64,7 +104,8 @@ def generate_html_content(data):
     html_parts.append("</body></html>")
     return "".join(html_parts)
 
-def convert_json_to_pdf(json_filename, pdf_filename):
+def convert_json_to_pdf(json_filename, pdf_filename, keep_temp=False):
+    """Конвертирует JSON-файл в PDF."""
     print(f"[*] Reading file: {json_filename}...")
     try:
         with open(json_filename, 'r', encoding='utf-8') as f:
@@ -74,10 +115,9 @@ def convert_json_to_pdf(json_filename, pdf_filename):
         return
 
     if not data:
-        print("[!] JSON is empty.")
+        print("[!] JSON dataset is empty.")
         return
 
-    # Настройки батчинга (по 400 записей за раз, чтобы не превысить лимит 512МБ)
     BATCH_SIZE = 400
     temp_pdfs = []
     
@@ -99,7 +139,6 @@ def convert_json_to_pdf(json_filename, pdf_filename):
             page = browser.new_page()
             page.goto(temp_html.as_uri(), wait_until="networkidle")
             
-            # Принудительная загрузка картинок
             page.evaluate("""
                 async () => {
                     const images = document.querySelectorAll('img');
@@ -125,30 +164,22 @@ def convert_json_to_pdf(json_filename, pdf_filename):
 
         browser.close()
 
-    # Склеивание всех частей в один файл
     print(f"[*] Merging {len(temp_pdfs)} PDF parts...")
     merger = PdfWriter()
     for pdf in temp_pdfs:
         merger.append(pdf)
     
+    for page in merger.pages:
+        page.compress_content_streams()
+    
     final_output = f"{pdf_filename}.pdf" if not pdf_filename.endswith(".pdf") else pdf_filename
     merger.write(final_output)
     merger.close()
 
-    # Удаление временных PDF
-    for pdf in temp_pdfs:
-        if os.path.exists(pdf):
-            os.remove(pdf)
+    if not keep_temp:
+        for pdf in temp_pdfs:
+            if os.path.exists(pdf):
+                os.remove(pdf)
+        print("[*] Temporary files cleaned up.")
             
-    print(f"[+] Success! Final file: {final_output}")
-
-if __name__ == "__main__":
-    print("=== Collected Data to PDF Converter ===")
-    print("1. Twitter (bookmarks.json -> twitter_bookmarks.pdf)")
-    print("2. Discord (disc_msgs.json -> discord_messages.pdf)")
-    print("3. Bluesky (bsky_bookmarks.json -> bsky_bookmarks.pdf)")
-    
-    choice = input("\nChoose a file for conversion (1, 2 or 3): ").strip()
-    file_name = input("Enter the JSON filename (with .json extension): ").strip()
-
-    convert_json_to_pdf(file_name, file_name)
+    print(f"[+] PDF generation completed: {final_output}")
