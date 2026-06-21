@@ -48,6 +48,35 @@ def download_media_direct(url, save_path):
     except Exception as e:
         print(f"\n[!] Error downloading {url}: {e}")
 
+def download_telegram_blob(page, blob_url, save_path):
+    """Скачивает blob: URL-адрес путем конвертации его в Base64 внутри контекста страницы."""
+    try:
+        b64_data = page.evaluate("""async (url) => {
+            try {
+                const response = await fetch(url);
+                const blob = await response.blob();
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+            } catch (e) {
+                return null;
+            }
+        }""", blob_url)
+        
+        if b64_data and "," in b64_data:
+            header, encoded = b64_data.split(",", 1)
+            import base64
+            data = base64.b64decode(encoded)
+            with open(save_path, "wb") as f:
+                f.write(data)
+            return True
+    except Exception as e:
+        print(f"\n[!] Error downloading Telegram blob {blob_url}: {e}")
+    return False
+
 def download_image_twitter(url, save_path):
     """Скачивает изображение Twitter в максимальном качестве."""
     url = re.sub(r'name=[^&]+', 'name=orig', url)
@@ -96,7 +125,7 @@ def download_video_async(post_url, post_id, cookie_file, scraped_posts, json_fil
 def save_json_data(scraped_data, filename):
     """Безопасное сохранение данных в JSON."""
     with json_lock:
-        if "disc_msgs" in filename:
+        if "disc_msgs" in filename or "telegram_messages" in filename:
             sorted_msgs = sorted(scraped_data.values(), key=lambda x: int(x["id"]))
             data_to_save = sorted_msgs
         else:
@@ -111,7 +140,7 @@ def load_json_data(filename):
         try:
             with open(filename, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if "disc_msgs" in filename:
+                if "disc_msgs" in filename or "telegram_messages" in filename:
                     return {item["id"]: item for item in data}
                 return {item["url"]: item for item in data}
         except Exception as e:
@@ -134,6 +163,451 @@ def export_cookies(browser, cookie_file):
             f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
 
 # --- Скрейперы ---
+
+def scrape_telegram_messages():
+    """Сбор сообщений из открытого чата/канала Telegram Web с обработкой ленивой загрузки."""
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    json_file = "telegram_messages.json"
+    scraped_msgs = load_json_data(json_file)
+    
+    with sync_playwright() as p:
+        executable_path = p.chromium.executable_path
+        user_data_dir = get_chrome_testing_user_data_dir()
+        
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            executable_path=executable_path,
+            headless=False,
+            args=["--start-maximized"],
+            no_viewport=True,
+        )
+        
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        page.goto("https://web.telegram.org/a", wait_until="domcontentloaded")
+        
+        input("\n[!] Откройте нужный чат/группу в Telegram Web, затем нажмите ENTER здесь для старта...")
+        
+        # Переключение на активную вкладку Telegram
+        target_page = page
+        for p_obj in browser.pages:
+            if "telegram.org" in p_obj.url:
+                target_page = p_obj
+                break
+        page = target_page
+
+        no_new_msgs_count = 0
+        previous_count = len(scraped_msgs)
+
+        print("\n=== Telegram Collection started. Press CTRL+C to stop ===")
+
+        try:
+            while True:
+                # Извлечение данных сообщений через JS внутри страницы
+                extracted = page.evaluate("""() => {
+                    const messages = [];
+                    const msgElements = document.querySelectorAll('.MessageList .Message');
+                    msgElements.forEach(msg => {
+                        const msgId = msg.getAttribute('data-message-id');
+                        if (!msgId) return;
+                        
+                        // Поиск контейнера группы сообщений для получения имени автора
+                        const groupContainer = msg.closest('.sender-group-container');
+                        let author = "Unknown";
+                        if (groupContainer) {
+                            const avatarImg = groupContainer.querySelector('.Avatar img');
+                            if (avatarImg && avatarImg.getAttribute('alt')) {
+                                author = avatarImg.getAttribute('alt');
+                            }
+                            const senderTitle = groupContainer.querySelector('.sender-title');
+                            if (senderTitle) {
+                                author = senderTitle.textContent.trim();
+                            }
+                        }
+                        
+                        // Проверка имени автора внутри самого блока сообщения
+                        const internalTitle = msg.querySelector('.sender-title');
+                        if (internalTitle) {
+                            author = internalTitle.textContent.trim();
+                        }
+
+                        // Извлечение текста сообщения
+                        const textEl = msg.querySelector('.text-content');
+                        let text = "";
+                        if (textEl) {
+                            const clone = textEl.cloneNode(true);
+                            const meta = clone.querySelector('.MessageMeta');
+                            if (meta) meta.remove();
+                            text = clone.textContent.trim();
+                        } else {
+                            const contentInner = msg.querySelector('.content-inner');
+                            if (contentInner) {
+                                const clone = contentInner.cloneNode(true);
+                                const subheader = clone.querySelector('.message-subheader');
+                                if (subheader) subheader.remove();
+                                const meta = clone.querySelector('.MessageMeta');
+                                if (meta) meta.remove();
+                                text = clone.textContent.trim();
+                            }
+                        }
+
+                        // Время и дата сообщения
+                        const timeEl = msg.querySelector('.message-time');
+                        const timeStr = timeEl ? timeEl.textContent.trim() : "";
+                        
+                        const dateGroup = msg.closest('.message-date-group');
+                        const dateHeader = dateGroup ? dateGroup.querySelector('.sticky-date') : null;
+                        const dateStr = dateHeader ? dateHeader.textContent.trim() : "";
+                        const fullDate = dateStr ? `${dateStr} ${timeStr}`.trim() : timeStr;
+
+                        // Сбор медиафайлов (исключая аватары)
+                        const mediaUrls = [];
+                        const imgs = msg.querySelectorAll('.media-inner img, .Album img, img.full-media');
+                        imgs.forEach(img => {
+                            const src = img.getAttribute('src');
+                            if (src) mediaUrls.push(src);
+                        });
+                        const videos = msg.querySelectorAll('video');
+                        videos.forEach(v => {
+                            const src = v.getAttribute('src');
+                            if (src) mediaUrls.push(src);
+                        });
+
+                        messages.push({
+                            id: msgId,
+                            author: author,
+                            date: fullDate,
+                            text: text,
+                            media_urls: mediaUrls
+                        });
+                    });
+                    return messages;
+                }""")
+                
+                new_messages_in_batch = False
+
+                for item in extracted:
+                    msg_id = item["id"]
+                    
+                    has_content = bool(item["text"] or item["media_urls"])
+                    if not has_content:
+                        # Пропускаем пустые заглушки (сообщения в процессе ленивой загрузки)
+                        continue
+
+                    if msg_id in scraped_msgs:
+                        # Логика обновления существующих записей при дозагрузке контента
+                        existing = scraped_msgs[msg_id]
+                        has_new_text = bool(item["text"]) and not bool(existing.get("text"))
+                        has_new_media = bool(item["media_urls"]) and len(item["media_urls"]) > len(existing.get("local_media", []))
+                        
+                        if has_new_text or has_new_media:
+                            updated_text = item["text"] if item["text"] else existing.get("text", "")
+                            local_media_paths = list(existing.get("local_media", []))
+                            
+                            if has_new_media:
+                                for idx, url in enumerate(item["media_urls"]):
+                                    ext = "jpg"
+                                    if "video" in url or ".mp4" in url:
+                                        ext = "mp4"
+                                    elif "png" in url:
+                                        ext = "png"
+                                    elif "gif" in url:
+                                        ext = "gif"
+                                    
+                                    filename = f"tg_{msg_id}_media_{idx}.{ext}"
+                                    filepath = os.path.join(MEDIA_DIR, filename)
+                                    local_path = os.path.abspath(filepath)
+                                    
+                                    if not os.path.exists(filepath):
+                                        if url.startswith("blob:"):
+                                            success = download_telegram_blob(page, url, filepath)
+                                            if success and local_path not in local_media_paths:
+                                                local_media_paths.append(local_path)
+                                        else:
+                                            download_media_direct(url, filepath)
+                                            if os.path.exists(filepath) and local_path not in local_media_paths:
+                                                local_media_paths.append(local_path)
+                                    else:
+                                        if local_path not in local_media_paths:
+                                            local_media_paths.append(local_path)
+                                            
+                            scraped_msgs[msg_id] = {
+                                "id": msg_id,
+                                "author": item["author"] or existing.get("author", "Unknown"),
+                                "date": item["date"] or existing.get("date", ""),
+                                "text": updated_text,
+                                "local_media": local_media_paths
+                            }
+                            new_messages_in_batch = True
+                        continue
+
+                    # Обработка нового сообщения с контентом
+                    local_media_paths = []
+                    for idx, url in enumerate(item["media_urls"]):
+                        ext = "jpg"
+                        if "video" in url or ".mp4" in url:
+                            ext = "mp4"
+                        elif "png" in url:
+                            ext = "png"
+                        elif "gif" in url:
+                            ext = "gif"
+                        
+                        filename = f"tg_{msg_id}_media_{idx}.{ext}"
+                        filepath = os.path.join(MEDIA_DIR, filename)
+                        local_path = os.path.abspath(filepath)
+                        
+                        if not os.path.exists(filepath):
+                            if url.startswith("blob:"):
+                                success = download_telegram_blob(page, url, filepath)
+                                if success:
+                                    local_media_paths.append(local_path)
+                            else:
+                                download_media_direct(url, filepath)
+                                if os.path.exists(filepath):
+                                        local_media_paths.append(local_path)
+                        else:
+                            local_media_paths.append(local_path)
+
+                    scraped_msgs[msg_id] = {
+                        "id": msg_id,
+                        "author": item["author"],
+                        "date": item["date"],
+                        "text": item["text"],
+                        "local_media": local_media_paths
+                    }
+                    new_messages_in_batch = True
+
+                if new_messages_in_batch:
+                    save_json_data(scraped_msgs, json_file)
+
+                # Прокрутка вверх
+                page.evaluate("const el = document.querySelector('.MessageList'); if(el) el.scrollBy(0, -600);")
+                try:
+                    page.locator('.MessageList').focus(timeout=500)
+                    page.keyboard.press("PageUp")
+                except Exception:
+                    pass
+
+                # Проверка на достижение самого верха контейнера прокрутки
+                is_at_top = page.evaluate("""() => {
+                    const el = document.querySelector('.MessageList');
+                    if (!el) return false;
+                    return el.scrollTop <= 5;
+                }""")
+                
+                if is_at_top:
+                    no_new_msgs_count += 1
+                    if no_new_msgs_count >= 15:  # Итерации на догрузку на случай задержки сети
+                        print("\n[+] Достигнуто начало истории чата. Сбор завершен.")
+                        break
+                else:
+                    no_new_msgs_count = 0
+
+                print(f"Собрано {len(scraped_msgs)} сообщений. Прокрутка вверх...", end="\r")
+                time.sleep(2.0)  # Слегка увеличен интервал для более стабильной подгрузки тяжелых медиа
+
+        except KeyboardInterrupt:
+            print("\n\n[!] Прерывание процесса пользователем...")
+        finally:
+            save_json_data(scraped_msgs, json_file)
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    """Сбор сообщений из открытого чата/канала Telegram Web."""
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    json_file = "telegram_messages.json"
+    scraped_msgs = load_json_data(json_file)
+    
+    with sync_playwright() as p:
+        executable_path = p.chromium.executable_path
+        user_data_dir = get_chrome_testing_user_data_dir()
+        
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            executable_path=executable_path,
+            headless=False,
+            args=["--start-maximized"],
+            no_viewport=True,
+        )
+        
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        page.goto("https://web.telegram.org/a", wait_until="domcontentloaded")
+        
+        input("\n[!] Откройте нужный чат/группу в Telegram Web, затем нажмите ENTER здесь для старта...")
+        
+        # Переключение на активную страницу
+        target_page = page
+        for p_obj in browser.pages:
+            if "telegram.org" in p_obj.url:
+                target_page = p_obj
+                break
+        page = target_page
+
+        no_new_msgs_count = 0
+        previous_count = len(scraped_msgs)
+
+        print("\n=== Collection started. Press CTRL+C to stop ===")
+
+        try:
+            while True:
+                # Извлечение данных сообщений через JS внутри страницы
+                extracted = page.evaluate("""() => {
+                    const messages = [];
+                    const msgElements = document.querySelectorAll('.MessageList .Message');
+                    msgElements.forEach(msg => {
+                        const msgId = msg.getAttribute('data-message-id');
+                        if (!msgId) return;
+                        
+                        // Поиск контейнера группы сообщений для получения имени автора
+                        const groupContainer = msg.closest('.sender-group-container');
+                        let author = "Unknown";
+                        if (groupContainer) {
+                            const avatarImg = groupContainer.querySelector('.Avatar img');
+                            if (avatarImg && avatarImg.getAttribute('alt')) {
+                                author = avatarImg.getAttribute('alt');
+                            }
+                            const senderTitle = groupContainer.querySelector('.sender-title');
+                            if (senderTitle) {
+                                author = senderTitle.textContent.trim();
+                            }
+                        }
+                        
+                        // Проверка имени автора внутри самого блока сообщения
+                        const internalTitle = msg.querySelector('.sender-title');
+                        if (internalTitle) {
+                            author = internalTitle.textContent.trim();
+                        }
+
+                        // Извлечение текста сообщения
+                        const textEl = msg.querySelector('.text-content');
+                        let text = "";
+                        if (textEl) {
+                            const clone = textEl.cloneNode(true);
+                            const meta = clone.querySelector('.MessageMeta');
+                            if (meta) meta.remove();
+                            text = clone.textContent.trim();
+                        } else {
+                            const contentInner = msg.querySelector('.content-inner');
+                            if (contentInner) {
+                                const clone = contentInner.cloneNode(true);
+                                const subheader = clone.querySelector('.message-subheader');
+                                if (subheader) subheader.remove();
+                                const meta = clone.querySelector('.MessageMeta');
+                                if (meta) meta.remove();
+                                text = clone.textContent.trim();
+                            }
+                        }
+
+                        // Время и дата сообщения
+                        const timeEl = msg.querySelector('.message-time');
+                        const timeStr = timeEl ? timeEl.textContent.trim() : "";
+                        
+                        const dateGroup = msg.closest('.message-date-group');
+                        const dateHeader = dateGroup ? dateGroup.querySelector('.sticky-date') : null;
+                        const dateStr = dateHeader ? dateHeader.textContent.trim() : "";
+                        const fullDate = dateStr ? `${dateStr} ${timeStr}`.trim() : timeStr;
+
+                        // Сбор медиафайлов
+                        const mediaUrls = [];
+                        const imgs = msg.querySelectorAll('.media-inner img, .Album img, img.full-media');
+                        imgs.forEach(img => {
+                            const src = img.getAttribute('src');
+                            if (src) mediaUrls.push(src);
+                        });
+                        const videos = msg.querySelectorAll('video');
+                        videos.forEach(v => {
+                            const src = v.getAttribute('src');
+                            if (src) mediaUrls.push(src);
+                        });
+
+                        messages.push({
+                            id: msgId,
+                            author: author,
+                            date: fullDate,
+                            text: text,
+                            media_urls: mediaUrls
+                        });
+                    });
+                    return messages;
+                }""")
+                
+                new_messages_in_batch = False
+
+                for item in extracted:
+                    msg_id = item["id"]
+                    if msg_id in scraped_msgs:
+                        continue
+
+                    local_media_paths = []
+                    for idx, url in enumerate(item["media_urls"]):
+                        ext = "jpg"
+                        if "video" in url or ".mp4" in url:
+                            ext = "mp4"
+                        elif "png" in url:
+                            ext = "png"
+                        elif "gif" in url:
+                            ext = "gif"
+                        
+                        filename = f"tg_{msg_id}_media_{idx}.{ext}"
+                        filepath = os.path.join(MEDIA_DIR, filename)
+                        local_path = os.path.abspath(filepath)
+                        
+                        if not os.path.exists(filepath):
+                            if url.startswith("blob:"):
+                                # Скачивание blob-объектов через API браузера
+                                success = download_telegram_blob(page, url, filepath)
+                                if success:
+                                    local_media_paths.append(local_path)
+                            else:
+                                # Скачивание стандартных URL-адресов
+                                download_media_direct(url, filepath)
+                                if os.path.exists(filepath):
+                                    local_media_paths.append(local_path)
+                        else:
+                            local_media_paths.append(local_path)
+
+                    scraped_msgs[msg_id] = {
+                        "id": msg_id,
+                        "author": item["author"],
+                        "date": item["date"],
+                        "text": item["text"],
+                        "local_media": local_media_paths
+                    }
+                    new_messages_in_batch = True
+
+                if len(scraped_msgs) == previous_count:
+                    no_new_msgs_count += 1
+                    if no_new_msgs_count >= 100:
+                        print("\n[!] Сбор остановлен (достигнут верх истории или лимит прокруток).")
+                        break
+                else:
+                    no_new_msgs_count = 0
+                    
+                previous_count = len(scraped_msgs)
+                if new_messages_in_batch:
+                    save_json_data(scraped_msgs, json_file)
+                
+                print(f"Собрано {len(scraped_msgs)} сообщений. Ожидание: {no_new_msgs_count}/100. Прокрутка вверх...", end="\r")
+                
+                # Прокрутка контейнера сообщений вверх
+                page.evaluate("const el = document.querySelector('.MessageList'); if(el) el.scrollBy(0, -800);")
+                try:
+                    page.locator('.MessageList').focus(timeout=500)
+                    page.keyboard.press("PageUp")
+                except Exception:
+                    pass
+                    
+                time.sleep(1.5)
+
+        except KeyboardInterrupt:
+            print("\n\n[!] Прерывание процесса пользователем...")
+        finally:
+            save_json_data(scraped_msgs, json_file)
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 def scrape_vk_profile_page(page, url, scraped_posts, executor, json_file):
     """Сбор публикаций со стены профиля или сообщества ВК."""
@@ -238,11 +712,9 @@ def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
 
     try:
         while True:
-            # Парсинг страницы через Scrapling Selector
             html_content = page.content()
             selector = Selector(html_content)
             
-            # Поиск блоков с фото в сетке альбома
             photo_elements = selector.css('div.photos_row, div[class*="photos_row"]')
             new_posts_in_batch = False
 
@@ -251,7 +723,6 @@ def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
                 if not href:
                     continue
                 
-                # Создаем стандартизированный URL фотографии
                 match = re.search(r'photo-?\d+_\d+', href)
                 photo_id = match.group(0) if match else os.path.basename(href).split('?')[0]
                 post_url = f"https://vk.com/{photo_id}"
@@ -259,7 +730,6 @@ def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
                 if post_url in scraped_posts:
                     continue
 
-                # Извлечение URL изображения из инлайнового background-image
                 style_attr = el.css('::attr(style)').get() or ""
                 img_src = None
                 if 'url(' in style_attr:
@@ -271,10 +741,7 @@ def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
                 if not img_src:
                     continue
 
-                # Декодируем HTML-сущности (например, &amp; -> &) для корректного запроса к CDN
                 img_src = html.unescape(img_src)
-
-                # Подменяем размер превью (например, cs=240x0) на максимально качественный (cs=1280x0)
                 img_src = re.sub(r'cs=\d+x\d+', 'cs=1280x0', img_src)
 
                 filename = f"{photo_id}.jpg"
@@ -293,9 +760,7 @@ def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
                 }
                 new_posts_in_batch = True
 
-            # Проверка прогресса для остановки при отсутствии нового контента
             if len(scraped_posts) == previous_count:
-                # Если кнопка «Показать больше» видна, кликаем по ней
                 load_more = page.locator("#ui_photos_load_more, ._ui_photos_load_more").first
                 if load_more.is_visible():
                     try:
@@ -350,11 +815,9 @@ def scrape_vk():
             
             input("\n[!] Open the target VK Album or Profile/Group wall in the browser, then press Enter to start...")
             
-            # Умный поиск активной вкладки, на которой пользователь открыл контент
             target_page = page
             for p_obj in browser.pages:
                 if "vk.com" in p_obj.url:
-                    # Если нашли вкладку, которая не является фидом новостей, переключаемся на нее
                     if "album" in p_obj.url or "photo" in p_obj.url or "wall" in p_obj.url:
                         target_page = p_obj
                         break
@@ -366,7 +829,6 @@ def scrape_vk():
             target_url = page.url
             print(f"[*] Starting scraper on: {target_url}")
             
-            # Автоматическое определение типа контента на базе URL и структуры DOM
             is_album = "/album" in target_url or "/photos" in target_url or "/photo" in target_url
             if not is_album:
                 if page.locator(".photos_album_page, .photos_row").count() > 0:
