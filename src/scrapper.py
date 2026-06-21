@@ -5,6 +5,7 @@ import time
 import json
 import requests
 import re
+import html
 import subprocess
 import threading
 from urllib.parse import urlparse
@@ -14,8 +15,12 @@ from scrapling.parser import Selector
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Настройка сессии запросов
+# Настройка сессии запросов с заголовками во избежание 403 Forbidden со стороны серверов ВК
 session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://vk.com/"
+})
 retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
@@ -35,13 +40,13 @@ def get_chrome_testing_user_data_dir():
 def download_media_direct(url, save_path):
     """Скачивает медиафайл по прямой ссылке."""
     try:
-        response = session.get(url, stream=True, timeout=(3, 7))
+        response = session.get(url, stream=True, timeout=(5, 15))
         response.raise_for_status()
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(8192):
                 f.write(chunk)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"\n[!] Error downloading {url}: {e}")
 
 def download_image_twitter(url, save_path):
     """Скачивает изображение Twitter в максимальном качестве."""
@@ -139,189 +144,186 @@ def scrape_vk_profile_page(page, url, scraped_posts, executor, json_file):
         profile_name = profile_name.split('\xa0')[0].split('\n')[0].strip()
         
     print(f"[*] Page Name: {profile_name}")
+    print("\n=== Collection started. Press CTRL+C to stop ===")
     
-    print("[*] Scrolling wall to trigger lazy loading of posts...")
-    for i in range(5):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1.5)
-        print(f"  Scroll {i+1}/5 completed...", end="\r")
-    print()
-
-    posts = page.locator("[data-testid='post'], article[data-post-id]")
-    total_posts = posts.count()
-    print(f"[+] Found {total_posts} wall posts on the page.")
+    no_new_posts_count = 0
+    previous_count = len(scraped_posts)
     
-    new_items_count = 0
-    for i in range(total_posts):
-        post_locator = posts.nth(i)
-        post_id = post_locator.get_attribute("data-post-id")
-        
-        if not post_id:
-            post_id_attr = post_locator.get_attribute("id")
-            if post_id_attr and "_" in post_id_attr:
-                post_id = post_id_attr
+    try:
+        while True:
+            html_content = page.content()
+            selector = Selector(html_content)
+            posts = selector.css("[data-testid='post'], article[data-post-id]")
+            
+            new_posts_in_batch = False
+            
+            for post_locator in posts:
+                post_id = post_locator.css('::attr(data-post-id)').get()
+                if not post_id:
+                    post_id_attr = post_locator.css('::attr(id)').get()
+                    if post_id_attr and "_" in post_id_attr:
+                        post_id = post_id_attr
+                    else:
+                        continue
+                        
+                post_url = f"https://vk.com/wall{post_id}"
+                
+                if post_url in scraped_posts:
+                    continue
+                    
+                # Дата публикации
+                date_text = post_locator.css("[data-testid='post_date_block_preview'] ::text, a[href*='/wall'] ::text").get() or "Unknown Date"
+                date_text = date_text.strip()
+                
+                # Текст публикации
+                text_content = post_locator.css("[data-testid='showmoretext'] ::text, .vkitFeedShowMoreText__text--0wZYb ::text, [id^='text-'] ::text").getall()
+                text_content = "".join(text_content).strip()
+                
+                # Фотографии публикации
+                img_urls = post_locator.css("img[data-testid='media-grid-image']::attr(src), .vkitMediaGridImage__image--60h5h::attr(src), a[href*='/photo'] img::attr(src)").getall()
+                img_urls = list(set(img_urls))
+                
+                local_media_paths = []
+                for idx, img_url in enumerate(img_urls):
+                    filename = f"vk_{post_id}_img_{idx}.jpg"
+                    filepath = os.path.join(MEDIA_DIR, filename)
+                    local_path = os.path.abspath(filepath)
+                    
+                    decoded_img_url = html.unescape(img_url)
+                    executor.submit(download_media_direct, decoded_img_url, filepath)
+                    local_media_paths.append(local_path)
+                    
+                scraped_posts[post_url] = {
+                    "url": post_url,
+                    "date": date_text,
+                    "text": text_content,
+                    "author": profile_name,
+                    "local_media": local_media_paths
+                }
+                new_posts_in_batch = True
+                
+            if len(scraped_posts) == previous_count:
+                no_new_posts_count += 1
+                if no_new_posts_count >= 500:
+                    print("\n[!] Limit reached (500 idle scrolls). Auto-stopping.")
+                    break
             else:
-                post_id = f"post_{i}"
+                no_new_posts_count = 0
                 
-        post_url = f"https://vk.com/wall{post_id}"
-        
-        if post_url in scraped_posts:
-            continue
-            
-        # Дата публикации
-        date_elem = post_locator.locator("[data-testid='post_date_block_preview'], a[href*='/wall']").first
-        date_text = date_elem.text_content().strip() if date_elem.count() > 0 else "Unknown Date"
-        
-        # Текст публикации
-        text_elem = post_locator.locator("[data-testid='showmoretext'], .vkitFeedShowMoreText__text--0wZYb, [id^='text-']").first
-        text_content = text_elem.text_content().strip() if text_elem.count() > 0 else ""
-        
-        # Фотографии публикации
-        img_locators = post_locator.locator("img[data-testid='media-grid-image'], .vkitMediaGridImage__image--60h5h, a[href*='/photo'] img")
-        img_count = img_locators.count()
-        img_urls = []
-        for j in range(img_count):
-            src = img_locators.nth(j).get_attribute("src")
-            if src and src not in img_urls:
-                img_urls.append(src)
+            previous_count = len(scraped_posts)
+            if new_posts_in_batch:
+                save_json_data(scraped_posts, json_file)
                 
-        local_media_paths = []
-        for idx, img_url in enumerate(img_urls):
-            filename = f"vk_{post_id}_img_{idx}.jpg"
-            filepath = os.path.join(MEDIA_DIR, filename)
-            local_path = os.path.abspath(filepath)
+            print(f"Collected {len(scraped_posts)} posts. Idle: {no_new_posts_count}/500. Scrolling down...", end="\r")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(1.0)
             
-            executor.submit(download_media_direct, img_url, filepath)
-            local_media_paths.append(local_path)
-            
-        scraped_posts[post_url] = {
-            "url": post_url,
-            "date": date_text,
-            "text": text_content,
-            "author": profile_name,
-            "local_media": local_media_paths
-        }
-        new_items_count += 1
-        
-    if new_items_count > 0:
+    except KeyboardInterrupt:
+        print("\n\n[!] Stop signal received. Terminating...")
+    finally:
         save_json_data(scraped_posts, json_file)
-        print(f"[+] Saved {new_items_count} new wall posts to {json_file}")
-    else:
-        print("[*] No new posts detected to save.")
 
 def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
-    """Логика парсинга фотографий альбома ВК."""
-    print("[*] Scrolling and loading all photos in the album...")
-    last_photo_count = 0
-    no_change_count = 0
-    while True:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1)
-        
-        # Используем .first для предотвращения Strict Mode Error
-        load_more = page.locator("#ui_photos_load_more, ._ui_photos_load_more").first
-        if load_more.is_visible():
-            try:
-                load_more.click(timeout=3000)
-                time.sleep(1.5)
-            except Exception:
-                pass
-        
-        current_photos = page.locator(".photos_row")
-        current_count = current_photos.count()
-        print(f"Loaded thumbnails: {current_count}...", end="\r")
-        
-        if current_count == last_photo_count:
-            no_change_count += 1
-            if no_change_count >= 5:
-                break
-        else:
-            no_change_count = 0
-            last_photo_count = current_count
-            
-    total_photos = last_photo_count
-    print(f"\n[+] Total photos in album found on page: {total_photos}")
+    """Сбор изображений альбома ВК методом прокрутки страницы."""
+    no_new_posts_count = 0
+    previous_count = len(scraped_posts)
     
-    if total_photos == 0:
-        print("[!] No photos found on page. Exiting.")
-        return
-        
     album_title = "VK Album"
-    title_elem = page.locator("h1")
+    title_elem = page.locator("h1").first
     if title_elem.count() > 0:
-        album_title = title_elem.first.text_content().strip()
-        
+        album_title = title_elem.text_content().strip()
+
     print(f"[*] Album Title: {album_title}")
-    
-    # Открываем первое фото
-    first_photo = page.locator(".photos_row a").first
-    first_photo.click()
-    page.wait_for_selector(".pv_photo_wrap, #pv_photo_wrap, .pv_img_area_wrap img", timeout=15000)
-    
-    print("\n=== Photoview overlay open. Collecting files and metadata... ===")
-    
-    last_img_src = None
-    for idx in range(total_photos):
-        time.sleep(0.5)
-        
-        img_selector = ".pv_img_area_wrap img, #pv_photo img"
-        img_src = None
-        for _ in range(15):
-            img_elem = page.locator(img_selector).first
-            if img_elem.count() > 0:
-                temp_src = img_elem.get_attribute("src")
-                if temp_src and temp_src != last_img_src:
-                    img_src = temp_src
-                    break
-            time.sleep(0.2)
-        
-        if not img_src and img_elem.count() > 0:
-            img_src = img_elem.get_attribute("src")
+    print("\n=== Collection started. Press CTRL+C to stop ===")
+
+    try:
+        while True:
+            # Парсинг страницы через Scrapling Selector
+            html_content = page.content()
+            selector = Selector(html_content)
             
-        last_img_src = img_src
-        
-        desc_text = ""
-        desc_elem = page.locator("#pv_desc, .pv_desc, #pv_description").first
-        if desc_elem.count() > 0:
-            desc_text = desc_elem.text_content().strip()
-            
-        date_text = "Unknown Date"
-        date_elem = page.locator("#pv_date, .pv_date, .pv_time").first
-        if date_elem.count() > 0:
-            date_text = date_elem.text_content().strip()
-            
-        # Исправлено: Свойство page.url в Playwright Python возвращает строку, скобки не нужны
-        current_url = page.url
-        photo_id = current_url.split('/')[-1].split('?')[0] if '/photo' in current_url else f"photo_{idx}"
-        
-        print(f"[{idx+1}/{total_photos}] URL: {current_url} | Img: {img_src[:50] if img_src else 'None'}...")
-        
-        if img_src and current_url not in scraped_posts:
-            ext = "jpg"
-            if ".png" in img_src.lower():
-                ext = "png"
-            elif ".gif" in img_src.lower():
-                ext = "gif"
-            elif ".webp" in img_src.lower():
-                ext = "webp"
+            # Поиск блоков с фото в сетке альбома
+            photo_elements = selector.css('div.photos_row, div[class*="photos_row"]')
+            new_posts_in_batch = False
+
+            for el in photo_elements:
+                href = el.css('a::attr(href)').get()
+                if not href:
+                    continue
                 
-            filename = f"{photo_id}.{ext}"
-            filepath = os.path.join(MEDIA_DIR, filename)
-            local_path = os.path.abspath(filepath)
+                # Создаем стандартизированный URL фотографии
+                match = re.search(r'photo-?\d+_\d+', href)
+                photo_id = match.group(0) if match else os.path.basename(href).split('?')[0]
+                post_url = f"https://vk.com/{photo_id}"
+
+                if post_url in scraped_posts:
+                    continue
+
+                # Извлечение URL изображения из инлайнового background-image
+                style_attr = el.css('::attr(style)').get() or ""
+                img_src = None
+                if 'url(' in style_attr:
+                    start = style_attr.find('url(') + 4
+                    end = style_attr.find(')', start)
+                    if end != -1:
+                        img_src = style_attr[start:end].strip('\'"')
+
+                if not img_src:
+                    continue
+
+                # Декодируем HTML-сущности (например, &amp; -> &) для корректного запроса к CDN
+                img_src = html.unescape(img_src)
+
+                # Подменяем размер превью (например, cs=240x0) на максимально качественный (cs=1280x0)
+                img_src = re.sub(r'cs=\d+x\d+', 'cs=1280x0', img_src)
+
+                filename = f"{photo_id}.jpg"
+                filepath = os.path.join(MEDIA_DIR, filename)
+                local_path = os.path.abspath(filepath)
+
+                if not os.path.exists(filepath):
+                    executor.submit(download_media_direct, img_src, filepath)
+
+                scraped_posts[post_url] = {
+                    "url": post_url,
+                    "date": "Unknown Date",
+                    "text": "",
+                    "author": album_title,
+                    "local_media": [local_path]
+                }
+                new_posts_in_batch = True
+
+            # Проверка прогресса для остановки при отсутствии нового контента
+            if len(scraped_posts) == previous_count:
+                # Если кнопка «Показать больше» видна, кликаем по ней
+                load_more = page.locator("#ui_photos_load_more, ._ui_photos_load_more").first
+                if load_more.is_visible():
+                    try:
+                        load_more.click(timeout=2000)
+                        time.sleep(1.5)
+                    except Exception:
+                        pass
+                
+                no_new_posts_count += 1
+                if no_new_posts_count >= 500:
+                    print("\n[!] Limit reached (500 idle scrolls). Auto-stopping.")
+                    break
+            else:
+                no_new_posts_count = 0
+                
+            previous_count = len(scraped_posts)
+            if new_posts_in_batch:
+                save_json_data(scraped_posts, json_file)
+
+            print(f"Collected {len(scraped_posts)} photos. Idle: {no_new_posts_count}/500. Scrolling down...", end="\r")
             
-            executor.submit(download_media_direct, img_src, filepath)
-            
-            scraped_posts[current_url] = {
-                "url": current_url,
-                "date": date_text,
-                "text": desc_text,
-                "author": album_title,
-                "local_media": [local_path]
-            }
-            
-            save_json_data(scraped_posts, json_file)
-        
-        page.keyboard.press("ArrowRight")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n\n[!] Stop signal received. Terminating...")
+    finally:
+        save_json_data(scraped_posts, json_file)
 
 def scrape_vk():
     """Интерактивная точка входа с поддержкой автоматического определения типа открытой страницы."""
@@ -342,31 +344,49 @@ def scrape_vk():
             args=["--start-maximized"],
         )
         
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        page.goto("https://vk.com")
-        
-        input("\n[!] Open the target VK Album or Profile/Group wall in the browser, then press Enter to start...")
-        
-        # Исправлено: Свойство page.url в Playwright Python возвращает строку, скобки не нужны
-        target_url = page.url
-        print(f"[*] Starting scraper on: {target_url}")
-        
-        # Автоматическое определение типа контента на текущей вкладке
-        is_profile = False
-        if page.locator(".ProfileHeader, [data-testid='profile-header'], #profile_redesigned, #owner_page_name, #page-wall").count() > 0:
-            is_profile = True
-        elif "/album" not in target_url and "/photos" not in target_url:
-            is_profile = True
+        try:
+            page = browser.pages[0] if browser.pages else browser.new_page()
+            page.goto("https://vk.com")
             
-        if is_profile:
-            print("[+] Auto-detected content type: VK Profile or Page")
-            scrape_vk_profile_page(page, target_url, scraped_posts, executor, json_file)
-        else:
-            print("[+] Auto-detected content type: VK Photo Album")
-            scrape_vk_album_logic(page, target_url, scraped_posts, executor, json_file)
+            input("\n[!] Open the target VK Album or Profile/Group wall in the browser, then press Enter to start...")
             
-        browser.close()
-        executor.shutdown(wait=True)
+            # Умный поиск активной вкладки, на которой пользователь открыл контент
+            target_page = page
+            for p_obj in browser.pages:
+                if "vk.com" in p_obj.url:
+                    # Если нашли вкладку, которая не является фидом новостей, переключаемся на нее
+                    if "album" in p_obj.url or "photo" in p_obj.url or "wall" in p_obj.url:
+                        target_page = p_obj
+                        break
+                    elif p_obj.locator(".photos_album_page, .photos_row, [data-testid='post']").count() > 0:
+                        target_page = p_obj
+                        break
+            
+            page = target_page
+            target_url = page.url
+            print(f"[*] Starting scraper on: {target_url}")
+            
+            # Автоматическое определение типа контента на базе URL и структуры DOM
+            is_album = "/album" in target_url or "/photos" in target_url or "/photo" in target_url
+            if not is_album:
+                if page.locator(".photos_album_page, .photos_row").count() > 0:
+                    is_album = True
+                
+            if not is_album:
+                print("[+] Auto-detected content type: VK Profile or Page")
+                scrape_vk_profile_page(page, target_url, scraped_posts, executor, json_file)
+            else:
+                print("[+] Auto-detected content type: VK Photo Album")
+                scrape_vk_album_logic(page, target_url, scraped_posts, executor, json_file)
+                
+        except KeyboardInterrupt:
+            print("\n[!] Stop signal received. Terminating...")
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            executor.shutdown(wait=True)
 
 def scrape_discord_messages():
     os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -464,7 +484,7 @@ def scrape_discord_messages():
                 time.sleep(2)
                 
         except KeyboardInterrupt:
-            print("\n\n[!] Stop signal received. Terminating collection...")
+            print("\n\n[!] Stop signal received. Terminating...")
         finally:
             print("\nWaiting for background downloads to finish...")
             executor.shutdown(wait=True)
