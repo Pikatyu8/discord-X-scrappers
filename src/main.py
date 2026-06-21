@@ -21,7 +21,7 @@ def launch_chrome_for_testing():
         print("="*50)
 
         if not os.path.exists(executable_path):
-            print("\n[!] Chrome for Testing is missing. Install it using: scrapling install")
+            print("\n[!] Chrome for Testing is missing. Install it using: playwright install chromium")
             return
 
         browser = p.chromium.launch_persistent_context(
@@ -38,14 +38,17 @@ def launch_chrome_for_testing():
         print("1. Twitter (x.com)")
         print("2. Discord (discord.com)")
         print("3. Bluesky (bsky.app)")
+        print("4. VKontakte (vk.com)")
         
-        choice = input("Enter choice (1-3) or press Enter to open default page: ").strip()
+        choice = input("Enter choice (1-4) or press Enter to open default page: ").strip()
         if choice == "1":
             page.goto("https://x.com/home")
         elif choice == "2":
             page.goto("https://discord.com/channels/@me")
         elif choice == "3":
             page.goto("https://bsky.app")
+        elif choice == "4":
+            page.goto("https://vk.com")
         else:
             page.goto("https://google.com")
 
@@ -58,9 +61,10 @@ def pdf_conversion_menu():
     print("1. Convert Discord data (disc_msgs.json)")
     print("2. Convert Twitter data (bookmarks.json)")
     print("3. Convert Bluesky data (bsky_bookmarks.json)")
-    print("4. Custom JSON file conversion")
+    print("4. Convert VK data (vk_data.json)")
+    print("5. Custom JSON file conversion")
     
-    choice = input("Select option (1-4): ").strip()
+    choice = input("Select option (1-5): ").strip()
     
     if choice == "1":
         file_name = "disc_msgs.json"
@@ -72,6 +76,9 @@ def pdf_conversion_menu():
         file_name = "bsky_bookmarks.json"
         out_name = "bluesky_bookmarks.pdf"
     elif choice == "4":
+        file_name = "vk_data.json"
+        out_name = "vk_archive.pdf"
+    elif choice == "5":
         file_name = input("Enter JSON filename (with extension): ").strip()
         out_name = input("Enter target PDF filename (with extension): ").strip()
     else:
@@ -90,11 +97,12 @@ def main():
         print("2. Run Discord Scraper")
         print("3. Run Twitter Bookmarks Scraper")
         print("4. Run Bluesky Saved Posts Scraper")
-        print("5. Generate PDF Archive from JSON")
-        print("6. Exit")
+        print("5. Run VK Scraper (Auto-detect Album/Page)")
+        print("6. Generate PDF Archive from JSON")
+        print("7. Exit")
         print("═"*40)
         
-        choice = input("Select an action (1-6): ").strip()
+        choice = input("Select an action (1-7): ").strip()
         
         if choice == "1":
             launch_chrome_for_testing()
@@ -105,8 +113,10 @@ def main():
         elif choice == "4":
             scraper.scrape_bluesky_bookmarks()
         elif choice == "5":
-            pdf_conversion_menu()
+            scraper.scrape_vk()
         elif choice == "6":
+            pdf_conversion_menu()
+        elif choice == "7":
             print("\nExiting program.")
             break
         else:
