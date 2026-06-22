@@ -8,6 +8,7 @@ import re
 import html
 import subprocess
 import threading
+import shutil
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright
@@ -24,7 +25,8 @@ session.headers.update({
 retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-json_lock = threading.Lock()
+# Использование реентерабельного лока для потокобезопасной работы со словарем и файлами
+json_lock = threading.RLock()
 EXTENSION_PATH = os.path.abspath("./ext/InsensitiveX")
 MEDIA_DIR = "./media"
 
@@ -38,15 +40,17 @@ def get_chrome_testing_user_data_dir():
         return os.path.expanduser("~/.config/google-chrome-for-testing")
 
 def download_media_direct(url, save_path):
-    """Скачивает медиафайл по прямой ссылке."""
+    """Скачивает медиафайл по прямой ссылке. Возвращает True при успехе."""
     try:
         response = session.get(url, stream=True, timeout=(5, 15))
         response.raise_for_status()
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(8192):
                 f.write(chunk)
+        return True
     except Exception as e:
         print(f"\n[!] Error downloading {url}: {e}")
+        return False
 
 def download_telegram_blob(page, blob_url, save_path):
     """Скачивает blob: URL-адрес путем конвертации его в Base64 внутри контекста страницы."""
@@ -114,8 +118,10 @@ def download_video_async(post_url, post_id, cookie_file, scraped_posts, json_fil
         for file in os.listdir(MEDIA_DIR):
             if file.startswith(f"{post_id}_video") and not file.endswith('.part') and not file.endswith('.ytdl'):
                 file_path = os.path.abspath(os.path.join(MEDIA_DIR, file))
-                if file_path not in scraped_posts[post_url]["local_media"]:
-                    scraped_posts[post_url]["local_media"].append(file_path)
+                with json_lock:
+                    if post_url in scraped_posts:
+                        if file_path not in scraped_posts[post_url]["local_media"]:
+                            scraped_posts[post_url]["local_media"].append(file_path)
         
         save_json_data(scraped_posts, json_filename)
         print(f"\n[+] Background video download finished: {post_url}")
@@ -135,16 +141,29 @@ def save_json_data(scraped_data, filename):
             json.dump(data_to_save, f, ensure_ascii=False, indent=4)
 
 def load_json_data(filename):
-    """Загрузка существующих записей для предотвращения дублирования."""
+    """Загрузка существующих записей с защитой от поврежденных файлов."""
     if os.path.exists(filename):
         try:
             with open(filename, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                if not isinstance(data, list):
+                    raise ValueError("JSON root element is not a list as expected.")
                 if "disc_msgs" in filename or "telegram_messages" in filename:
                     return {item["id"]: item for item in data}
                 return {item["url"]: item for item in data}
         except Exception as e:
-            print(f"Error loading existing JSON: {e}")
+            backup_filename = f"{filename}.corrupted"
+            try:
+                shutil.copy2(filename, backup_filename)
+                backup_msg = f"A backup of the corrupted file was saved as '{backup_filename}'."
+            except Exception as backup_err:
+                backup_msg = f"Failed to create backup: {backup_err}"
+            
+            print(f"\n[!] CRITICAL ERROR: Failed to load existing JSON file '{filename}': {e}")
+            print(f"[!] {backup_msg}")
+            print("[!] To prevent loss of data, execution has been stopped.")
+            print("[!] Please check or repair the JSON file manually before running the scraper again.")
+            sys.exit(1)
     return {}
 
 def export_cookies(browser, cookie_file):
@@ -164,10 +183,9 @@ def export_cookies(browser, cookie_file):
 
 # --- Скрейперы ---
 
-def scrape_telegram_messages():
+def scrape_telegram_messages(json_file="telegram_messages.json"):
     """Сбор сообщений из открытого чата/канала Telegram Web с обработкой ленивой загрузки."""
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    json_file = "telegram_messages.json"
     scraped_msgs = load_json_data(json_file)
     
     with sync_playwright() as p:
@@ -293,88 +311,88 @@ def scrape_telegram_messages():
                         # Пропускаем пустые заглушки (сообщения в процессе ленивой загрузки)
                         continue
 
-                    if msg_id in scraped_msgs:
-                        # Логика обновления существующих записей при дозагрузке контента
-                        existing = scraped_msgs[msg_id]
-                        has_new_text = bool(item["text"]) and not bool(existing.get("text"))
-                        has_new_media = bool(item["media_urls"]) and len(item["media_urls"]) > len(existing.get("local_media", []))
-                        
-                        if has_new_text or has_new_media:
-                            updated_text = item["text"] if item["text"] else existing.get("text", "")
-                            local_media_paths = list(existing.get("local_media", []))
+                    with json_lock:
+                        if msg_id in scraped_msgs:
+                            # Логика обновления существующих записей при дозагрузке контента
+                            existing = scraped_msgs[msg_id]
+                            has_new_text = bool(item["text"]) and not bool(existing.get("text"))
+                            has_new_media = bool(item["media_urls"]) and len(item["media_urls"]) > len(existing.get("local_media", []))
                             
-                            if has_new_media:
-                                for idx, url in enumerate(item["media_urls"]):
-                                    ext = "jpg"
-                                    if "video" in url or ".mp4" in url:
-                                        ext = "mp4"
-                                    elif "png" in url:
-                                        ext = "png"
-                                    elif "gif" in url:
-                                        ext = "gif"
-                                    
-                                    filename = f"tg_{msg_id}_media_{idx}.{ext}"
-                                    filepath = os.path.join(MEDIA_DIR, filename)
-                                    local_path = os.path.abspath(filepath)
-                                    
-                                    if not os.path.exists(filepath):
-                                        if url.startswith("blob:"):
-                                            success = download_telegram_blob(page, url, filepath)
-                                            if success and local_path not in local_media_paths:
-                                                local_media_paths.append(local_path)
+                            if has_new_text or has_new_media:
+                                updated_text = item["text"] if item["text"] else existing.get("text", "")
+                                local_media_paths = list(existing.get("local_media", []))
+                                
+                                if has_new_media:
+                                    for idx, url in enumerate(item["media_urls"]):
+                                        ext = "jpg"
+                                        if "video" in url or ".mp4" in url:
+                                            ext = "mp4"
+                                        elif "png" in url:
+                                            ext = "png"
+                                        elif "gif" in url:
+                                            ext = "gif"
+                                        
+                                        filename = f"tg_{msg_id}_media_{idx}.{ext}"
+                                        filepath = os.path.join(MEDIA_DIR, filename)
+                                        local_path = os.path.abspath(filepath)
+                                        
+                                        if not os.path.exists(filepath):
+                                            if url.startswith("blob:"):
+                                                success = download_telegram_blob(page, url, filepath)
+                                                if success and local_path not in local_media_paths:
+                                                    local_media_paths.append(local_path)
+                                            else:
+                                                if download_media_direct(url, filepath):
+                                                    if local_path not in local_media_paths:
+                                                        local_media_paths.append(local_path)
                                         else:
-                                            download_media_direct(url, filepath)
-                                            if os.path.exists(filepath) and local_path not in local_media_paths:
+                                            if local_path not in local_media_paths:
                                                 local_media_paths.append(local_path)
-                                    else:
-                                        if local_path not in local_media_paths:
-                                            local_media_paths.append(local_path)
-                                            
-                            scraped_msgs[msg_id] = {
-                                "id": msg_id,
-                                "author": item["author"] or existing.get("author", "Unknown"),
-                                "date": item["date"] or existing.get("date", ""),
-                                "text": updated_text,
-                                "local_media": local_media_paths
-                            }
-                            new_messages_in_batch = True
-                        continue
+                                                
+                                scraped_msgs[msg_id] = {
+                                    "id": msg_id,
+                                    "author": item["author"] or existing.get("author", "Unknown"),
+                                    "date": item["date"] or existing.get("date", ""),
+                                    "text": updated_text,
+                                    "local_media": local_media_paths
+                                }
+                                new_messages_in_batch = True
+                            continue
 
-                    # Обработка нового сообщения с контентом
-                    local_media_paths = []
-                    for idx, url in enumerate(item["media_urls"]):
-                        ext = "jpg"
-                        if "video" in url or ".mp4" in url:
-                            ext = "mp4"
-                        elif "png" in url:
-                            ext = "png"
-                        elif "gif" in url:
-                            ext = "gif"
-                        
-                        filename = f"tg_{msg_id}_media_{idx}.{ext}"
-                        filepath = os.path.join(MEDIA_DIR, filename)
-                        local_path = os.path.abspath(filepath)
-                        
-                        if not os.path.exists(filepath):
-                            if url.startswith("blob:"):
-                                success = download_telegram_blob(page, url, filepath)
-                                if success:
-                                    local_media_paths.append(local_path)
-                            else:
-                                download_media_direct(url, filepath)
-                                if os.path.exists(filepath):
+                        # Обработка нового сообщения с контентом
+                        local_media_paths = []
+                        for idx, url in enumerate(item["media_urls"]):
+                            ext = "jpg"
+                            if "video" in url or ".mp4" in url:
+                                ext = "mp4"
+                            elif "png" in url:
+                                ext = "png"
+                            elif "gif" in url:
+                                ext = "gif"
+                            
+                            filename = f"tg_{msg_id}_media_{idx}.{ext}"
+                            filepath = os.path.join(MEDIA_DIR, filename)
+                            local_path = os.path.abspath(filepath)
+                            
+                            if not os.path.exists(filepath):
+                                if url.startswith("blob:"):
+                                    success = download_telegram_blob(page, url, filepath)
+                                    if success:
                                         local_media_paths.append(local_path)
-                        else:
-                            local_media_paths.append(local_path)
+                                else:
+                                    if download_media_direct(url, filepath):
+                                        local_media_paths.append(local_path)
+                            else:
+                                local_media_paths.append(local_path)
 
-                    scraped_msgs[msg_id] = {
-                        "id": msg_id,
-                        "author": item["author"],
-                        "date": item["date"],
-                        "text": item["text"],
-                        "local_media": local_media_paths
-                    }
-                    new_messages_in_batch = True
+                        scraped_msgs[msg_id] = {
+                            "id": msg_id,
+                            "author": item["author"],
+                            "date": item["date"],
+                            "text": item["text"],
+                            "local_media": local_media_paths
+                        }
+                        new_messages_in_batch = True
 
                 if new_messages_in_batch:
                     save_json_data(scraped_msgs, json_file)
@@ -404,201 +422,6 @@ def scrape_telegram_messages():
 
                 print(f"Собрано {len(scraped_msgs)} сообщений. Прокрутка вверх...", end="\r")
                 time.sleep(2.0)  # Слегка увеличен интервал для более стабильной подгрузки тяжелых медиа
-
-        except KeyboardInterrupt:
-            print("\n\n[!] Прерывание процесса пользователем...")
-        finally:
-            save_json_data(scraped_msgs, json_file)
-            try:
-                browser.close()
-            except Exception:
-                pass
-
-    """Сбор сообщений из открытого чата/канала Telegram Web."""
-    os.makedirs(MEDIA_DIR, exist_ok=True)
-    json_file = "telegram_messages.json"
-    scraped_msgs = load_json_data(json_file)
-    
-    with sync_playwright() as p:
-        executable_path = p.chromium.executable_path
-        user_data_dir = get_chrome_testing_user_data_dir()
-        
-        browser = p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            executable_path=executable_path,
-            headless=False,
-            args=["--start-maximized"],
-            no_viewport=True,
-        )
-        
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        page.goto("https://web.telegram.org/a", wait_until="domcontentloaded")
-        
-        input("\n[!] Откройте нужный чат/группу в Telegram Web, затем нажмите ENTER здесь для старта...")
-        
-        # Переключение на активную страницу
-        target_page = page
-        for p_obj in browser.pages:
-            if "telegram.org" in p_obj.url:
-                target_page = p_obj
-                break
-        page = target_page
-
-        no_new_msgs_count = 0
-        previous_count = len(scraped_msgs)
-
-        print("\n=== Collection started. Press CTRL+C to stop ===")
-
-        try:
-            while True:
-                # Извлечение данных сообщений через JS внутри страницы
-                extracted = page.evaluate("""() => {
-                    const messages = [];
-                    const msgElements = document.querySelectorAll('.MessageList .Message');
-                    msgElements.forEach(msg => {
-                        const msgId = msg.getAttribute('data-message-id');
-                        if (!msgId) return;
-                        
-                        // Поиск контейнера группы сообщений для получения имени автора
-                        const groupContainer = msg.closest('.sender-group-container');
-                        let author = "Unknown";
-                        if (groupContainer) {
-                            const avatarImg = groupContainer.querySelector('.Avatar img');
-                            if (avatarImg && avatarImg.getAttribute('alt')) {
-                                author = avatarImg.getAttribute('alt');
-                            }
-                            const senderTitle = groupContainer.querySelector('.sender-title');
-                            if (senderTitle) {
-                                author = senderTitle.textContent.trim();
-                            }
-                        }
-                        
-                        // Проверка имени автора внутри самого блока сообщения
-                        const internalTitle = msg.querySelector('.sender-title');
-                        if (internalTitle) {
-                            author = internalTitle.textContent.trim();
-                        }
-
-                        // Извлечение текста сообщения
-                        const textEl = msg.querySelector('.text-content');
-                        let text = "";
-                        if (textEl) {
-                            const clone = textEl.cloneNode(true);
-                            const meta = clone.querySelector('.MessageMeta');
-                            if (meta) meta.remove();
-                            text = clone.textContent.trim();
-                        } else {
-                            const contentInner = msg.querySelector('.content-inner');
-                            if (contentInner) {
-                                const clone = contentInner.cloneNode(true);
-                                const subheader = clone.querySelector('.message-subheader');
-                                if (subheader) subheader.remove();
-                                const meta = clone.querySelector('.MessageMeta');
-                                if (meta) meta.remove();
-                                text = clone.textContent.trim();
-                            }
-                        }
-
-                        // Время и дата сообщения
-                        const timeEl = msg.querySelector('.message-time');
-                        const timeStr = timeEl ? timeEl.textContent.trim() : "";
-                        
-                        const dateGroup = msg.closest('.message-date-group');
-                        const dateHeader = dateGroup ? dateGroup.querySelector('.sticky-date') : null;
-                        const dateStr = dateHeader ? dateHeader.textContent.trim() : "";
-                        const fullDate = dateStr ? `${dateStr} ${timeStr}`.trim() : timeStr;
-
-                        // Сбор медиафайлов
-                        const mediaUrls = [];
-                        const imgs = msg.querySelectorAll('.media-inner img, .Album img, img.full-media');
-                        imgs.forEach(img => {
-                            const src = img.getAttribute('src');
-                            if (src) mediaUrls.push(src);
-                        });
-                        const videos = msg.querySelectorAll('video');
-                        videos.forEach(v => {
-                            const src = v.getAttribute('src');
-                            if (src) mediaUrls.push(src);
-                        });
-
-                        messages.push({
-                            id: msgId,
-                            author: author,
-                            date: fullDate,
-                            text: text,
-                            media_urls: mediaUrls
-                        });
-                    });
-                    return messages;
-                }""")
-                
-                new_messages_in_batch = False
-
-                for item in extracted:
-                    msg_id = item["id"]
-                    if msg_id in scraped_msgs:
-                        continue
-
-                    local_media_paths = []
-                    for idx, url in enumerate(item["media_urls"]):
-                        ext = "jpg"
-                        if "video" in url or ".mp4" in url:
-                            ext = "mp4"
-                        elif "png" in url:
-                            ext = "png"
-                        elif "gif" in url:
-                            ext = "gif"
-                        
-                        filename = f"tg_{msg_id}_media_{idx}.{ext}"
-                        filepath = os.path.join(MEDIA_DIR, filename)
-                        local_path = os.path.abspath(filepath)
-                        
-                        if not os.path.exists(filepath):
-                            if url.startswith("blob:"):
-                                # Скачивание blob-объектов через API браузера
-                                success = download_telegram_blob(page, url, filepath)
-                                if success:
-                                    local_media_paths.append(local_path)
-                            else:
-                                # Скачивание стандартных URL-адресов
-                                download_media_direct(url, filepath)
-                                if os.path.exists(filepath):
-                                    local_media_paths.append(local_path)
-                        else:
-                            local_media_paths.append(local_path)
-
-                    scraped_msgs[msg_id] = {
-                        "id": msg_id,
-                        "author": item["author"],
-                        "date": item["date"],
-                        "text": item["text"],
-                        "local_media": local_media_paths
-                    }
-                    new_messages_in_batch = True
-
-                if len(scraped_msgs) == previous_count:
-                    no_new_msgs_count += 1
-                    if no_new_msgs_count >= 100:
-                        print("\n[!] Сбор остановлен (достигнут верх истории или лимит прокруток).")
-                        break
-                else:
-                    no_new_msgs_count = 0
-                    
-                previous_count = len(scraped_msgs)
-                if new_messages_in_batch:
-                    save_json_data(scraped_msgs, json_file)
-                
-                print(f"Собрано {len(scraped_msgs)} сообщений. Ожидание: {no_new_msgs_count}/100. Прокрутка вверх...", end="\r")
-                
-                # Прокрутка контейнера сообщений вверх
-                page.evaluate("const el = document.querySelector('.MessageList'); if(el) el.scrollBy(0, -800);")
-                try:
-                    page.locator('.MessageList').focus(timeout=500)
-                    page.keyboard.press("PageUp")
-                except Exception:
-                    pass
-                    
-                time.sleep(1.5)
 
         except KeyboardInterrupt:
             print("\n\n[!] Прерывание процесса пользователем...")
@@ -658,22 +481,28 @@ def scrape_vk_profile_page(page, url, scraped_posts, executor, json_file):
                 img_urls = list(set(img_urls))
                 
                 local_media_paths = []
+                futures = []
                 for idx, img_url in enumerate(img_urls):
                     filename = f"vk_{post_id}_img_{idx}.jpg"
                     filepath = os.path.join(MEDIA_DIR, filename)
                     local_path = os.path.abspath(filepath)
                     
                     decoded_img_url = html.unescape(img_url)
-                    executor.submit(download_media_direct, decoded_img_url, filepath)
-                    local_media_paths.append(local_path)
+                    future = executor.submit(download_media_direct, decoded_img_url, filepath)
+                    futures.append((future, local_path))
+                
+                for future, local_path in futures:
+                    if future.result():
+                        local_media_paths.append(local_path)
                     
-                scraped_posts[post_url] = {
-                    "url": post_url,
-                    "date": date_text,
-                    "text": text_content,
-                    "author": profile_name,
-                    "local_media": local_media_paths
-                }
+                with json_lock:
+                    scraped_posts[post_url] = {
+                        "url": post_url,
+                        "date": date_text,
+                        "text": text_content,
+                        "author": profile_name,
+                        "local_media": local_media_paths
+                    }
                 new_posts_in_batch = True
                 
             if len(scraped_posts) == previous_count:
@@ -748,17 +577,22 @@ def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
                 filepath = os.path.join(MEDIA_DIR, filename)
                 local_path = os.path.abspath(filepath)
 
+                download_success = True
                 if not os.path.exists(filepath):
-                    executor.submit(download_media_direct, img_src, filepath)
+                    future = executor.submit(download_media_direct, img_src, filepath)
+                    download_success = future.result()
 
-                scraped_posts[post_url] = {
-                    "url": post_url,
-                    "date": "Unknown Date",
-                    "text": "",
-                    "author": album_title,
-                    "local_media": [local_path]
-                }
-                new_posts_in_batch = True
+                if download_success:
+                    local_media_paths = [local_path]
+                    with json_lock:
+                        scraped_posts[post_url] = {
+                            "url": post_url,
+                            "date": "Unknown Date",
+                            "text": "",
+                            "author": album_title,
+                            "local_media": local_media_paths
+                        }
+                    new_posts_in_batch = True
 
             if len(scraped_posts) == previous_count:
                 load_more = page.locator("#ui_photos_load_more, ._ui_photos_load_more").first
@@ -790,10 +624,9 @@ def scrape_vk_album_logic(page, url, scraped_posts, executor, json_file):
     finally:
         save_json_data(scraped_posts, json_file)
 
-def scrape_vk():
+def scrape_vk(json_file="vk_data.json"):
     """Интерактивная точка входа с поддержкой автоматического определения типа открытой страницы."""
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    json_file = "vk_data.json"
     scraped_posts = load_json_data(json_file)
     executor = ThreadPoolExecutor(max_workers=5)
 
@@ -850,9 +683,8 @@ def scrape_vk():
                 pass
             executor.shutdown(wait=True)
 
-def scrape_discord_messages():
+def scrape_discord_messages(json_file="disc_msgs.json"):
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    json_file = "disc_msgs.json"
     scraped_msgs = load_json_data(json_file)
     executor = ThreadPoolExecutor(max_workers=10)
     
@@ -910,23 +742,32 @@ def scrape_discord_messages():
                     media_urls = list(set(media_urls))
                     
                     local_media_paths = []
+                    futures = []
                     for url in media_urls:
                         parsed_url = urlparse(url)
                         filename = os.path.basename(parsed_url.path) or f"media_{msg_id}.dat"
                         save_filename = f"{msg_id}_{filename}"
                         filepath = os.path.join(MEDIA_DIR, save_filename)
-                        local_media_paths.append(os.path.abspath(filepath))
+                        local_path = os.path.abspath(filepath)
                         
                         if not os.path.exists(filepath):
-                            executor.submit(download_media_direct, url, filepath)
+                            future = executor.submit(download_media_direct, url, filepath)
+                            futures.append((future, local_path))
+                        else:
+                            local_media_paths.append(local_path)
+                    
+                    for future, local_path in futures:
+                        if future.result():
+                            local_media_paths.append(local_path)
 
-                    scraped_msgs[msg_id] = {
-                        "id": msg_id,
-                        "author": current_author,
-                        "date": date,
-                        "text": full_text,
-                        "local_media": local_media_paths
-                    }
+                    with json_lock:
+                        scraped_msgs[msg_id] = {
+                            "id": msg_id,
+                            "author": current_author,
+                            "date": date,
+                            "text": full_text,
+                            "local_media": local_media_paths
+                        }
                     new_messages_in_batch = True
 
                 if len(scraped_msgs) == previous_count:
@@ -956,9 +797,8 @@ def scrape_discord_messages():
             except Exception:
                 pass
 
-def scrape_twitter_bookmarks():
+def scrape_twitter_bookmarks(json_file="bookmarks.json"):
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    json_file = "bookmarks.json"
     cookie_file = "x_cookies.txt"
     scraped_posts = load_json_data(json_file)
     executor = ThreadPoolExecutor(max_workers=3)
@@ -1044,12 +884,13 @@ def scrape_twitter_bookmarks():
                             if download_image_twitter(img_url, filepath):
                                 local_media_paths.append(os.path.abspath(filepath))
 
-                    scraped_posts[post_url] = {
-                        "url": post_url,
-                        "date": date,
-                        "text": full_text,
-                        "local_media": local_media_paths
-                    }
+                    with json_lock:
+                        scraped_posts[post_url] = {
+                            "url": post_url,
+                            "date": date,
+                            "text": full_text,
+                            "local_media": local_media_paths
+                        }
                     new_posts_in_batch = True
 
                     if has_video and not video_exists:
@@ -1086,9 +927,8 @@ def scrape_twitter_bookmarks():
                 pass
             executor.shutdown(wait=True)
 
-def scrape_bluesky_bookmarks():
+def scrape_bluesky_bookmarks(json_file="bsky_bookmarks.json"):
     os.makedirs(MEDIA_DIR, exist_ok=True)
-    json_file = "bsky_bookmarks.json"
     cookie_file = "bsky_cookies.txt"
     scraped_posts = load_json_data(json_file)
     executor = ThreadPoolExecutor(max_workers=3)
@@ -1169,12 +1009,13 @@ def scrape_bluesky_bookmarks():
                             if download_image_bluesky(img_url, filepath):
                                 local_media_paths.append(os.path.abspath(filepath))
 
-                    scraped_posts[post_url] = {
-                        "url": post_url,
-                        "date": date or "Unknown",
-                        "text": full_text,
-                        "local_media": local_media_paths
-                    }
+                    with json_lock:
+                        scraped_posts[post_url] = {
+                            "url": post_url,
+                            "date": date or "Unknown",
+                            "text": full_text,
+                            "local_media": local_media_paths
+                        }
                     new_posts_in_batch = True
 
                     if has_video and not video_exists:
